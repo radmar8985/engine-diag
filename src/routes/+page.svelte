@@ -14,7 +14,7 @@
     power: { min: 0, max: 1000 }
   };
 
-  let currentReadings = { voltage1: 0, voltage2: 0, current1: 0, current2: 0, temperature: 0, rpm: 0, power: 0 };
+  let currentReadings = { voltage1: 0, voltage2: 0, voltage3: 0, current1: 0, current2: 0, current3: 0, temperature: 0, rpm: 0, power1: 0, power2: 0, power3: 0 };
 
   const MAX_POINTS = 30;
 
@@ -51,14 +51,16 @@
     voltages: {
       data: [
         { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 1 (V)', line: { color: '#3b82f6', width: 2 } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 2 (V)', line: { color: '#60a5fa', width: 2, dash: 'dot' } }
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 2 (V)', line: { color: '#60a5fa', width: 2, dash: 'dot' } },
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 3 (V)', line: { color: '#93c5fd', width: 2, dash: 'dash' } }
       ],
       layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Voltage (V)' } }
     },
     currents: {
       data: [
         { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 1 (A)', line: { color: '#10b981', width: 2 } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 2 (A)', line: { color: '#34d399', width: 2, dash: 'dot' } }
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 2 (A)', line: { color: '#34d399', width: 2, dash: 'dot' } },
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 3 (A)', line: { color: '#6ee7b7', width: 2, dash: 'dash' } }
       ],
       layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Current (A)' } }
     },
@@ -71,7 +73,11 @@
       layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'RPM' } }
     },
     power: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power (W)', line: { color: '#ec4899', width: 2 } }],
+      data: [
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power 1 (W)', line: { color: '#ec4899', width: 2 } },
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power 2 (W)', line: { color: '#f472b6', width: 2, dash: 'dot' } },
+        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power 3 (W)', line: { color: '#f9a8d4', width: 2, dash: 'dash' } }
+      ],
       layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Power (W)' } }
     }
   };
@@ -164,11 +170,11 @@
 
       // Update Grafana charts (if visible)
       if (selectedSource === 'Grafana' && grafanaChartsInitialized && voltChart) {
-        Plotly.extendTraces(voltChart, { x: [[now], [now]], y: [[data.voltage1], [data.voltage2]] }, [0, 1], MAX_POINTS);
-        Plotly.extendTraces(currChart, { x: [[now], [now]], y: [[data.current1], [data.current2]] }, [0, 1], MAX_POINTS);
+        Plotly.extendTraces(voltChart, { x: [[now], [now], [now]], y: [[data.voltage1], [data.voltage2], [data.voltage3]] }, [0, 1, 2], MAX_POINTS);
+        Plotly.extendTraces(currChart, { x: [[now], [now], [now]], y: [[data.current1], [data.current2], [data.current3]] }, [0, 1, 2], MAX_POINTS);
         Plotly.extendTraces(tempChart, { x: [[now]], y: [[data.temperature]] }, [0], MAX_POINTS);
         Plotly.extendTraces(rpmChart, { x: [[now]], y: [[data.rpm]] }, [0], MAX_POINTS);
-        Plotly.extendTraces(powerChart, { x: [[now]], y: [[data.power]] }, [0], MAX_POINTS);
+        Plotly.extendTraces(powerChart, { x: [[now], [now], [now]], y: [[data.power1], [data.power2], [data.power3]] }, [0, 1, 2], MAX_POINTS);
       }
 
       // Update CAN charts + stats (if visible)
@@ -222,6 +228,10 @@
           <div class="metric-header"><span class="metric-label">Voltage 2</span><div class="indicator"></div></div>
           <div class="metric-value">{currentReadings.voltage2.toFixed(1)} <span class="unit">V</span></div>
         </div>
+        <div class="metric-card status-{getStatus(currentReadings.voltage3, thresholds.voltage)}">
+          <div class="metric-header"><span class="metric-label">Voltage 3</span><div class="indicator"></div></div>
+          <div class="metric-value">{currentReadings.voltage3.toFixed(1)} <span class="unit">V</span></div>
+        </div>
       </div>
 
       <div class="metric-group">
@@ -233,8 +243,27 @@
           <div class="metric-header"><span class="metric-label">Current 2</span><div class="indicator"></div></div>
           <div class="metric-value">{currentReadings.current2.toFixed(1)} <span class="unit">A</span></div>
         </div>
+        <div class="metric-card status-{getStatus(currentReadings.current3, thresholds.current)}">
+          <div class="metric-header"><span class="metric-label">Current 3</span><div class="indicator"></div></div>
+          <div class="metric-value">{currentReadings.current3.toFixed(1)} <span class="unit">A</span></div>
+        </div>
       </div>
       
+      <div class="metric-group">
+        <div class="metric-card status-{getStatus(currentReadings.power1, thresholds.power)}">
+          <div class="metric-header"><span class="metric-label">Power 1</span><div class="indicator"></div></div>
+          <div class="metric-value">{currentReadings.power1.toFixed(0)} <span class="unit">W</span></div>
+        </div>
+        <div class="metric-card status-{getStatus(currentReadings.power2, thresholds.power)}">
+          <div class="metric-header"><span class="metric-label">Power 2</span><div class="indicator"></div></div>
+          <div class="metric-value">{currentReadings.power2.toFixed(0)} <span class="unit">W</span></div>
+        </div>
+        <div class="metric-card status-{getStatus(currentReadings.power3, thresholds.power)}">
+          <div class="metric-header"><span class="metric-label">Power 3</span><div class="indicator"></div></div>
+          <div class="metric-value">{currentReadings.power3.toFixed(0)} <span class="unit">W</span></div>
+        </div>
+      </div>
+
       <div class="metric-card status-{getStatus(currentReadings.temperature, thresholds.temperature)}">
         <div class="metric-header"><span class="metric-label">Temperature</span><div class="indicator"></div></div>
         <div class="metric-value">{currentReadings.temperature.toFixed(1)} <span class="unit">°C</span></div>
@@ -243,11 +272,6 @@
       <div class="metric-card status-{getStatus(currentReadings.rpm, thresholds.rpm)}">
         <div class="metric-header"><span class="metric-label">RPM</span><div class="indicator"></div></div>
         <div class="metric-value">{currentReadings.rpm.toFixed(0)}</div>
-      </div>
-
-      <div class="metric-card status-{getStatus(currentReadings.power, thresholds.power)}">
-        <div class="metric-header"><span class="metric-label">Power</span><div class="indicator"></div></div>
-        <div class="metric-value">{currentReadings.power.toFixed(0)} <span class="unit">W</span></div>
       </div>
     </div>
   </aside>
@@ -353,8 +377,8 @@
   .source-buttons { display: flex; flex-direction: column; gap: 8px; }
   .source-btn { background-color: #27272a; color: #e4e4e7; border: none; border-radius: 8px; padding: 12px 16px; text-align: left; font-size: 0.95rem; cursor: pointer; transition: all 0.2s; }
   .source-btn.active { background-color: #3b82f6; color: #ffffff; }
-  .metric-group { display: flex; gap: 8px; }
-  .metric-card { background-color: #27272a; border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; flex: 1; border: 1px solid transparent; transition: all 0.3s ease; }
+  .metric-group { display: flex; gap: 6px; }
+  .metric-card { background-color: #27272a; border-radius: 8px; padding: 10px 10px; display: flex; flex-direction: column; gap: 4px; flex: 1; border: 1px solid transparent; transition: all 0.3s ease; min-width: 0; }
   .metric-header { display: flex; justify-content: space-between; align-items: center; }
   .indicator { width: 8px; height: 8px; border-radius: 50%; background-color: #71717a; box-shadow: 0 0 0px transparent; transition: all 0.3s ease; }
   .status-normal .indicator { background-color: #10b981; }
@@ -362,9 +386,9 @@
   .status-alarm { border-color: #ef444433; background-color: #450a0a33; }
   .status-alarm .indicator { background-color: #ef4444; box-shadow: 0 0 12px #ef4444; animation: blink 1s infinite; }
   @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-  .metric-label { font-size: 0.8rem; color: #a1a1aa; }
-  .metric-value { font-size: 1.3rem; color: #ffffff; font-weight: 500; }
-  .unit { font-size: 0.85rem; color: #71717a; font-weight: normal; }
+  .metric-label { font-size: 0.7rem; color: #a1a1aa; }
+  .metric-value { font-size: 1.1rem; color: #ffffff; font-weight: 500; }
+  .unit { font-size: 0.75rem; color: #71717a; font-weight: normal; }
 
   /* ── Main area ── */
   .charts-area { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
