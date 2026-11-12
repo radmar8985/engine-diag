@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import { invoke } from '@tauri-apps/api/core';
   import Plotly from 'plotly.js-dist-min';
 
   let selectedSource = 'Grafana';
@@ -89,12 +90,12 @@
 
   const canChartConfigs = {
     chart1: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 1 (V)', line: { color: '#10b981', width: 2 } }],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Voltage 1 (V)' } }
+      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'FC Voltage (V)', line: { color: '#10b981', width: 2 } }],
+      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'FC Voltage (V)' } }
     },
     chart2: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 1 (A)', line: { color: '#10b981', width: 2 } }],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Current 1 (A)' } }
+      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'FC Current (A)', line: { color: '#10b981', width: 2 } }],
+      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'FC Current (A)' } }
     }
   };
 
@@ -115,17 +116,84 @@
     return Math.sqrt(arr.reduce((a, b) => a + b * b, 0) / arr.length);
   }
 
-  // CAN tab control form
-  let canInputs = ['', '', ''];
-  let canDropdowns = [1, 1, 1];
+  // ── CAN controls state (based on DBC) ──
 
-  function handleCanSend() {
-    console.log('CAN send:', { inputs: canInputs, dropdowns: canDropdowns });
-    // TODO: send via CAN bus through Tauri command
-    alert(`Wysłano magistralą CAN:\nWartości: ${canInputs.join(', ')}\nDropdowny: ${canDropdowns.join(', ')}`);
+  // FCCU Commands (1-bit each)
+  let fccuCmds = {
+    systemEnable: false,
+    mainValve: false,
+    manualPurge: false,
+    fanOn: false
+  };
+
+  // FCCU Settings
+  let fccuSettings = {
+    fanMode: 0,         // 0=Manual, 1=Linear Temp, 2=PID
+    purgeInterval: 60,  // 0-16383 seconds
+    pGain: 100,         // 0-1000
+    iGain: 50,          // 0-1000
+    dGain: 10           // 0-1000
+  };
+
+  // MCU Lighting (1-bit each)
+  let lighting = {
+    headlight: false,
+    positionLight: false,
+    brakeLight: false,
+    leftIndicator: false,
+    rightIndicator: false,
+    hazard: false
+  };
+
+  // CAN send status
+  let canSendStatus = '';
+
+  async function sendFccuCommands() {
+    try {
+      const result = await invoke('send_fccu_commands', {
+        systemEnable: fccuCmds.systemEnable,
+        mainValve: fccuCmds.mainValve,
+        manualPurge: fccuCmds.manualPurge,
+        fanOn: fccuCmds.fanOn
+      });
+      canSendStatus = result as string;
+    } catch (e) {
+      canSendStatus = `Błąd: ${e}`;
+    }
   }
 
-  // ── Init Grafana charts ──
+  async function sendFccuSettings() {
+    try {
+      const result = await invoke('send_fccu_settings', {
+        fanMode: fccuSettings.fanMode,
+        purgeInterval: fccuSettings.purgeInterval,
+        pGain: fccuSettings.pGain,
+        iGain: fccuSettings.iGain,
+        dGain: fccuSettings.dGain
+      });
+      canSendStatus = result as string;
+    } catch (e) {
+      canSendStatus = `Błąd: ${e}`;
+    }
+  }
+
+  async function sendLightingCmd() {
+    try {
+      const result = await invoke('send_lighting', {
+        headlight: lighting.headlight,
+        positionLight: lighting.positionLight,
+        brakeLight: lighting.brakeLight,
+        leftIndicator: lighting.leftIndicator,
+        rightIndicator: lighting.rightIndicator,
+        hazard: lighting.hazard
+      });
+      canSendStatus = result as string;
+    } catch (e) {
+      canSendStatus = `Błąd: ${e}`;
+    }
+  }
+
+  // ── Init charts ──
   async function initGrafanaCharts() {
     if (grafanaChartsInitialized) return;
     await tick();
@@ -138,7 +206,6 @@
     grafanaChartsInitialized = true;
   }
 
-  // ── Init CAN charts ──
   async function initCanCharts() {
     if (canChartsInitialized) return;
     await tick();
@@ -148,7 +215,6 @@
     canChartsInitialized = true;
   }
 
-  // ── Switch source ──
   async function switchSource(source: string) {
     selectedSource = source;
     if (source === 'Grafana') {
@@ -163,12 +229,14 @@
   onMount(() => {
     initGrafanaCharts();
 
-    const unlistenPromise = listen('engine-data-update', (event: any) => {
+    // PostgreSQL stream → Grafana tab
+    const unlistenPg = listen('engine-data-update', (event: any) => {
       const data = event.payload;
-      currentReadings = data;
+      if (selectedSource === 'Grafana') {
+        currentReadings = data;
+      }
       const now = new Date().toLocaleTimeString();
 
-      // Update Grafana charts (if visible)
       if (selectedSource === 'Grafana' && grafanaChartsInitialized && voltChart) {
         Plotly.extendTraces(voltChart, { x: [[now], [now], [now]], y: [[data.voltage1], [data.voltage2], [data.voltage3]] }, [0, 1, 2], MAX_POINTS);
         Plotly.extendTraces(currChart, { x: [[now], [now], [now]], y: [[data.current1], [data.current2], [data.current3]] }, [0, 1, 2], MAX_POINTS);
@@ -176,27 +244,50 @@
         Plotly.extendTraces(rpmChart, { x: [[now]], y: [[data.rpm]] }, [0], MAX_POINTS);
         Plotly.extendTraces(powerChart, { x: [[now], [now], [now]], y: [[data.power1], [data.power2], [data.power3]] }, [0, 1, 2], MAX_POINTS);
       }
+    });
 
-      // Update CAN charts + stats (if visible)
-      if (selectedSource === 'CAN' && canChartsInitialized && canChart1) {
-        Plotly.extendTraces(canChart1, { x: [[now]], y: [[data.voltage1]] }, [0], MAX_POINTS);
-        Plotly.extendTraces(canChart2, { x: [[now]], y: [[data.current1]] }, [0], MAX_POINTS);
+    // CAN stream → CAN tab
+    const unlistenCan = listen('can-data-update', (event: any) => {
+      const d = event.payload;
+      const now = new Date().toLocaleTimeString();
 
-        // Track history for stats
-        chart1History.push(data.voltage1);
-        chart2History.push(data.current1);
-        if (chart1History.length > MAX_POINTS) chart1History.shift();
-        if (chart2History.length > MAX_POINTS) chart2History.shift();
-
-        canStats = {
-          chart1: { newest: data.voltage1, average: calcAvg(chart1History), rms: calcRms(chart1History) },
-          chart2: { newest: data.current1, average: calcAvg(chart2History), rms: calcRms(chart2History) }
+      if (selectedSource === 'CAN') {
+        // Map CAN signals to sidebar readings
+        currentReadings = {
+          voltage1: d.fc_output_voltage ?? 0,
+          voltage2: d.sc_voltage ?? 0,
+          voltage3: d.mc_supply_voltage ?? 0,
+          current1: d.fc_output_current ?? 0,
+          current2: d.sc_current ?? 0,
+          current3: d.mc_supply_current ?? 0,
+          power1: d.fc_w ?? 0,
+          power2: (d.sc_voltage ?? 0) * (d.sc_current ?? 0),
+          power3: (d.mc_supply_voltage ?? 0) * (d.mc_supply_current ?? 0),
+          temperature: d.fc_temp ?? 0,
+          rpm: d.rpm ?? 0
         };
+
+        // Update CAN charts
+        if (canChartsInitialized && canChart1) {
+          Plotly.extendTraces(canChart1, { x: [[now]], y: [[d.fc_output_voltage ?? 0]] }, [0], MAX_POINTS);
+          Plotly.extendTraces(canChart2, { x: [[now]], y: [[d.fc_output_current ?? 0]] }, [0], MAX_POINTS);
+
+          chart1History.push(d.fc_output_voltage ?? 0);
+          chart2History.push(d.fc_output_current ?? 0);
+          if (chart1History.length > MAX_POINTS) chart1History.shift();
+          if (chart2History.length > MAX_POINTS) chart2History.shift();
+
+          canStats = {
+            chart1: { newest: d.fc_output_voltage ?? 0, average: calcAvg(chart1History), rms: calcRms(chart1History) },
+            chart2: { newest: d.fc_output_current ?? 0, average: calcAvg(chart2History), rms: calcRms(chart2History) }
+          };
+        }
       }
     });
 
     return () => {
-      unlistenPromise.then(unlisten => unlisten());
+      unlistenPg.then(u => u());
+      unlistenCan.then(u => u());
     };
   });
 </script>
@@ -248,7 +339,7 @@
           <div class="metric-value">{currentReadings.current3.toFixed(1)} <span class="unit">A</span></div>
         </div>
       </div>
-      
+
       <div class="metric-group">
         <div class="metric-card status-{getStatus(currentReadings.power1, thresholds.power)}">
           <div class="metric-header"><span class="metric-label">Power 1</span><div class="indicator"></div></div>
@@ -288,80 +379,145 @@
     {:else if selectedSource === 'CAN'}
       <!-- ═══ CAN VIEW ═══ -->
       <div class="can-panel">
-        <!-- Chart 1 with stats -->
+        <!-- Chart 1: FC Voltage with stats -->
         <div class="can-chart-row">
           <div class="can-chart-wrapper">
             <div class="chart-container compact">
-              <h3 class="chart-title">Voltage 1</h3>
+              <h3 class="chart-title">FC Voltage</h3>
               <div class="canvas-wrapper-can"><div class="plotly-chart" bind:this={canChart1}></div></div>
             </div>
           </div>
           <div class="can-stats">
-            <div class="stat-item">
-              <span class="stat-label">Najnowsza</span>
-              <span class="stat-value">{canStats.chart1.newest.toFixed(2)}</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-label">Średnia</span>
-              <span class="stat-value">{canStats.chart1.average.toFixed(2)}</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-label">Skuteczna</span>
-              <span class="stat-value">{canStats.chart1.rms.toFixed(2)}</span>
-            </div>
+            <div class="stat-item"><span class="stat-label">Najnowsza</span><span class="stat-value">{canStats.chart1.newest.toFixed(2)} V</span></div>
+            <div class="stat-item"><span class="stat-label">Średnia</span><span class="stat-value">{canStats.chart1.average.toFixed(2)} V</span></div>
+            <div class="stat-item"><span class="stat-label">Skuteczna</span><span class="stat-value">{canStats.chart1.rms.toFixed(2)} V</span></div>
           </div>
         </div>
 
-        <!-- Chart 2 with stats -->
+        <!-- Chart 2: FC Current with stats -->
         <div class="can-chart-row">
           <div class="can-chart-wrapper">
             <div class="chart-container compact">
-              <h3 class="chart-title">Current 1</h3>
+              <h3 class="chart-title">FC Current</h3>
               <div class="canvas-wrapper-can"><div class="plotly-chart" bind:this={canChart2}></div></div>
             </div>
           </div>
           <div class="can-stats">
-            <div class="stat-item">
-              <span class="stat-label">Najnowsza</span>
-              <span class="stat-value">{canStats.chart2.newest.toFixed(2)}</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-label">Średnia</span>
-              <span class="stat-value">{canStats.chart2.average.toFixed(2)}</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-label">Skuteczna</span>
-              <span class="stat-value">{canStats.chart2.rms.toFixed(2)}</span>
-            </div>
+            <div class="stat-item"><span class="stat-label">Najnowsza</span><span class="stat-value">{canStats.chart2.newest.toFixed(2)} A</span></div>
+            <div class="stat-item"><span class="stat-label">Średnia</span><span class="stat-value">{canStats.chart2.average.toFixed(2)} A</span></div>
+            <div class="stat-item"><span class="stat-label">Skuteczna</span><span class="stat-value">{canStats.chart2.rms.toFixed(2)} A</span></div>
           </div>
         </div>
 
-        <!-- Separator -->
         <div class="can-separator"></div>
 
-        <!-- Control form -->
-        <div class="can-controls">
-          {#each [0, 1, 2] as i}
-            <div class="control-row">
-              <input
-                type="number"
-                class="can-input"
-                placeholder="Wartość {i + 1}"
-                bind:value={canInputs[i]}
-              />
-              <select class="can-dropdown" bind:value={canDropdowns[i]}>
-                {#each Array.from({length: 10}, (_, k) => k + 1) as val}
-                  <option value={val}>{val}</option>
-                {/each}
-              </select>
-              {#if i === 2}
-                <button class="can-send-btn" on:click={handleCanSend}>Wyślij</button>
-              {:else}
-                <div class="can-send-placeholder"></div>
-              {/if}
-            </div>
-          {/each}
+        <!-- ═══ CAN CONTROLS ═══ -->
+
+        <!-- FCCU Commands -->
+        <div class="can-control-section">
+          <h3 class="control-section-title">FCCU Commands</h3>
+          <div class="checkbox-grid">
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.systemEnable} />
+              <span class="toggle-switch"></span>
+              <span>System Enable</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.mainValve} />
+              <span class="toggle-switch"></span>
+              <span>Main Valve</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.manualPurge} />
+              <span class="toggle-switch"></span>
+              <span>Manual Purge</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.fanOn} />
+              <span class="toggle-switch"></span>
+              <span>Fan On</span>
+            </label>
+          </div>
+          <button class="can-send-btn" on:click={sendFccuCommands}>Wyślij FCCU</button>
         </div>
+
+        <!-- FCCU Settings -->
+        <div class="can-control-section">
+          <h3 class="control-section-title">FCCU Settings</h3>
+          <div class="settings-grid">
+            <div class="setting-row">
+              <label class="setting-label">Fan Mode</label>
+              <select class="can-dropdown" bind:value={fccuSettings.fanMode}>
+                <option value={0}>Manual</option>
+                <option value={1}>Linear Temp</option>
+                <option value={2}>PID</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Purge Interval</label>
+              <div class="input-with-unit">
+                <input type="number" class="can-input" bind:value={fccuSettings.purgeInterval} min="0" max="16383" />
+                <span class="input-unit">s</span>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">P Gain</label>
+              <input type="number" class="can-input" bind:value={fccuSettings.pGain} min="0" max="1000" />
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">I Gain</label>
+              <input type="number" class="can-input" bind:value={fccuSettings.iGain} min="0" max="1000" />
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">D Gain</label>
+              <input type="number" class="can-input" bind:value={fccuSettings.dGain} min="0" max="1000" />
+            </div>
+          </div>
+          <button class="can-send-btn" on:click={sendFccuSettings}>Wyślij Settings</button>
+        </div>
+
+        <!-- MCU Lighting -->
+        <div class="can-control-section">
+          <h3 class="control-section-title">Lighting</h3>
+          <div class="checkbox-grid">
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={lighting.headlight} />
+              <span class="toggle-switch"></span>
+              <span>Headlight</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={lighting.positionLight} />
+              <span class="toggle-switch"></span>
+              <span>Position Light</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={lighting.brakeLight} />
+              <span class="toggle-switch"></span>
+              <span>Brake Light</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={lighting.leftIndicator} />
+              <span class="toggle-switch"></span>
+              <span>Left Indicator</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={lighting.rightIndicator} />
+              <span class="toggle-switch"></span>
+              <span>Right Indicator</span>
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" class="toggle-input" bind:checked={lighting.hazard} />
+              <span class="toggle-switch"></span>
+              <span>Hazard</span>
+            </label>
+          </div>
+          <button class="can-send-btn" on:click={sendLightingCmd}>Wyślij Lighting</button>
+        </div>
+
+        <!-- Status bar -->
+        {#if canSendStatus}
+          <div class="can-status-bar">{canSendStatus}</div>
+        {/if}
       </div>
     {/if}
   </main>
@@ -414,45 +570,90 @@
 
   .can-separator { height: 1px; background-color: #27272a; margin: 4px 0; }
 
-  .can-controls { display: flex; flex-direction: column; gap: 12px; }
-  .control-row { display: flex; gap: 12px; align-items: center; }
+  /* ── CAN control sections ── */
+  .can-control-section {
+    background-color: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 12px;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .control-section-title { font-size: 0.9rem; color: #a1a1aa; margin: 0; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* ── Toggle switches ── */
+  .checkbox-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .toggle-label { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 0.9rem; color: #e4e4e7; }
+  .toggle-input { display: none; }
+  .toggle-switch {
+    position: relative;
+    width: 40px;
+    height: 22px;
+    background-color: #3f3f46;
+    border-radius: 11px;
+    transition: background-color 0.2s;
+    flex-shrink: 0;
+  }
+  .toggle-switch::after {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 16px;
+    height: 16px;
+    background-color: #71717a;
+    border-radius: 50%;
+    transition: all 0.2s;
+  }
+  .toggle-input:checked + .toggle-switch { background-color: #22c55e; }
+  .toggle-input:checked + .toggle-switch::after { left: 21px; background-color: #ffffff; }
+
+  /* ── Settings grid ── */
+  .settings-grid { display: flex; flex-direction: column; gap: 10px; }
+  .setting-row { display: flex; align-items: center; gap: 12px; }
+  .setting-label { font-size: 0.85rem; color: #a1a1aa; width: 120px; flex-shrink: 0; }
+  .input-with-unit { display: flex; align-items: center; gap: 6px; flex: 1; }
+  .input-unit { font-size: 0.85rem; color: #71717a; }
 
   .can-input {
     flex: 1;
-    background-color: #18181b;
-    border: 1px solid #27272a;
+    background-color: #27272a;
+    border: 1px solid #3f3f46;
     border-radius: 8px;
-    padding: 10px 14px;
+    padding: 8px 12px;
     color: #e4e4e7;
-    font-size: 0.95rem;
+    font-size: 0.9rem;
     outline: none;
     transition: border-color 0.2s;
+    max-width: 160px;
   }
   .can-input:focus { border-color: #3b82f6; }
-  .can-input::placeholder { color: #52525b; }
 
   .can-dropdown {
-    width: 120px;
-    background-color: #18181b;
-    border: 1px solid #27272a;
+    flex: 1;
+    background-color: #27272a;
+    border: 1px solid #3f3f46;
     border-radius: 8px;
-    padding: 10px 14px;
+    padding: 8px 12px;
     color: #e4e4e7;
-    font-size: 0.95rem;
+    font-size: 0.9rem;
     outline: none;
     cursor: pointer;
     appearance: auto;
     transition: border-color 0.2s;
+    max-width: 160px;
   }
   .can-dropdown:focus { border-color: #3b82f6; }
 
   .can-send-btn {
+    align-self: flex-end;
     background-color: #dc2626;
     color: #ffffff;
     border: none;
     border-radius: 8px;
     padding: 10px 24px;
-    font-size: 0.95rem;
+    font-size: 0.9rem;
     font-weight: 600;
     cursor: pointer;
     transition: background-color 0.2s;
@@ -461,5 +662,12 @@
   .can-send-btn:hover { background-color: #b91c1c; }
   .can-send-btn:active { background-color: #991b1b; }
 
-  .can-send-placeholder { width: 100px; }
+  .can-status-bar {
+    background-color: #14532d;
+    border: 1px solid #22c55e33;
+    color: #86efac;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 0.85rem;
+  }
 </style>
