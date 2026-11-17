@@ -148,13 +148,24 @@
   // CAN send status
   let canSendStatus = '';
 
-  async function sendFccuCommands() {
+  async function toggleFccuCmd(cmdType: string) {
+    // Toggle local state
+    if (cmdType === 'system_enable') fccuCmds.systemEnable = !fccuCmds.systemEnable;
+    else if (cmdType === 'main_valve') fccuCmds.mainValve = !fccuCmds.mainValve;
+    else if (cmdType === 'manual_purge') fccuCmds.manualPurge = !fccuCmds.manualPurge;
+    else if (cmdType === 'fan_on') fccuCmds.fanOn = !fccuCmds.fanOn;
+
+    const stateMap: Record<string, boolean> = {
+      system_enable: fccuCmds.systemEnable,
+      main_valve: fccuCmds.mainValve,
+      manual_purge: fccuCmds.manualPurge,
+      fan_on: fccuCmds.fanOn
+    };
+
     try {
-      const result = await invoke('send_fccu_commands', {
-        systemEnable: fccuCmds.systemEnable,
-        mainValve: fccuCmds.mainValve,
-        manualPurge: fccuCmds.manualPurge,
-        fanOn: fccuCmds.fanOn
+      const result = await invoke('send_fccu_command', {
+        commandType: cmdType,
+        state: stateMap[cmdType]
       });
       canSendStatus = result as string;
     } catch (e) {
@@ -413,32 +424,23 @@
 
         <!-- ═══ CAN CONTROLS ═══ -->
 
-        <!-- FCCU Commands -->
+        <!-- FCCU Commands — instant toggle buttons -->
         <div class="can-control-section">
           <h3 class="control-section-title">FCCU Commands</h3>
-          <div class="checkbox-grid">
-            <label class="toggle-label">
-              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.systemEnable} />
-              <span class="toggle-switch"></span>
-              <span>System Enable</span>
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.mainValve} />
-              <span class="toggle-switch"></span>
-              <span>Main Valve</span>
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.manualPurge} />
-              <span class="toggle-switch"></span>
-              <span>Manual Purge</span>
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" class="toggle-input" bind:checked={fccuCmds.fanOn} />
-              <span class="toggle-switch"></span>
-              <span>Fan On</span>
-            </label>
+          <div class="fccu-btn-grid">
+            <button class="fccu-btn {fccuCmds.systemEnable ? 'active' : ''}" on:click={() => toggleFccuCmd('system_enable')}>
+              System Enable <span class="fccu-btn-state">{fccuCmds.systemEnable ? 'ON' : 'OFF'}</span>
+            </button>
+            <button class="fccu-btn {fccuCmds.mainValve ? 'active' : ''}" on:click={() => toggleFccuCmd('main_valve')}>
+              Main Valve <span class="fccu-btn-state">{fccuCmds.mainValve ? 'ON' : 'OFF'}</span>
+            </button>
+            <button class="fccu-btn {fccuCmds.manualPurge ? 'active' : ''}" on:click={() => toggleFccuCmd('manual_purge')}>
+              Manual Purge <span class="fccu-btn-state">{fccuCmds.manualPurge ? 'ON' : 'OFF'}</span>
+            </button>
+            <button class="fccu-btn {fccuCmds.fanOn ? 'active' : ''}" on:click={() => toggleFccuCmd('fan_on')}>
+              Fan On <span class="fccu-btn-state">{fccuCmds.fanOn ? 'ON' : 'OFF'}</span>
+            </button>
           </div>
-          <button class="can-send-btn" on:click={sendFccuCommands}>Wyślij FCCU</button>
         </div>
 
         <!-- FCCU Settings -->
@@ -669,5 +671,40 @@
     border-radius: 8px;
     padding: 8px 14px;
     font-size: 0.85rem;
+  }
+
+  /* ── FCCU instant toggle buttons ── */
+  .fccu-btn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .fccu-btn {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background-color: #27272a;
+    color: #a1a1aa;
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .fccu-btn:hover { border-color: #52525b; }
+  .fccu-btn.active {
+    background-color: #22c55e;
+    color: #ffffff;
+    border-color: #16a34a;
+  }
+  .fccu-btn.active:hover { background-color: #16a34a; }
+  .fccu-btn-state {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.8;
   }
 </style>

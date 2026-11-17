@@ -1,6 +1,10 @@
+mod pcan;
+
+use pcan::{PcanDriver, PCAN_USBBUS1, PCAN_BAUD_500K};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio_postgres::NoTls;
 
 // ── Data models ──
@@ -23,39 +27,43 @@ struct EngineData {
 /// CAN data received from the bus — maps to DBC signals
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 struct CanReadData {
-    // MCU_ANALOG_FUEL_CELL
+    // MCU_ANALOG_FUEL_CELL (0x04)
     fc_output_voltage: f64,
     fc_output_current: f64,
     h2_high_pressure: f64,
-    // MCU_ANALOG_POWERTRAIN
+    // MCU_ANALOG_POWERTRAIN (0x05)
     sc_voltage: f64,
     sc_current: f64,
     mc_supply_voltage: f64,
     mc_supply_current: f64,
-    // MCU_ANALOG_ACCESSORY
+    // MCU_ANALOG_ACCESSORY (0x06)
     ab_voltage: f64,
     ab_current: f64,
-    // MCU_ANALOG_DRIVE
+    // MCU_ANALOG_DRIVE (0x07)
     rpm: f64,
     speed: f64,
-    // FCCU_POWER
+    // FCCU_POWER (0x103)
     fccu_fc_voltage: f64,
     fccu_fc_current: f64,
     fccu_dcdc_voltage: f64,
     fccu_dcdc_current: f64,
-    // FCCU_ENVIRONMENT
+    // FCCU_ENVIRONMENT (0x104)
     fc_temp: f64,
     ambient_temp: f64,
     ambient_humidity: f64,
-    // PROTIUM_POWER
+    // PROTIUM_POWER (0x100)
     fc_w: f64,
     energy_wh: f64,
-    // MCU_STATE
+    // MCU_STATE (0x00)
     mcu_status: u8,
     vehicle_type: u8,
     motor_controller_enabled: bool,
     main_valve_enabled: bool,
 }
+
+// ── Shared PCAN state ──
+
+struct CanState(Option<Arc<PcanDriver>>);
 
 // ── PostgreSQL stream (Grafana tab) ──
 
@@ -72,7 +80,10 @@ fn start_pg_stream(app_handle: AppHandle) {
             pg_host, pg_port, pg_user, pg_password, pg_dbname
         );
 
-        println!("Łączenie z PostgreSQL: host={} port={} user={} dbname={}", pg_host, pg_port, pg_user, pg_dbname);
+        println!(
+            "Łączenie z PostgreSQL: host={} port={} user={} dbname={}",
+            pg_host, pg_port, pg_user, pg_dbname
+        );
 
         let client = loop {
             match tokio_postgres::connect(&conn_string, NoTls).await {
@@ -86,7 +97,10 @@ fn start_pg_stream(app_handle: AppHandle) {
                     break client;
                 }
                 Err(e) => {
-                    eprintln!("Błąd połączenia z PostgreSQL: {:?}. Ponowna próba za 3s...", e);
+                    eprintln!(
+                        "Błąd połączenia z PostgreSQL: {:?}. Ponowna próba za 3s...",
+                        e
+                    );
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
             }
@@ -135,104 +149,191 @@ fn start_pg_stream(app_handle: AppHandle) {
     });
 }
 
+// ── CAN frame decoder ──
+
+/// Decode a single CAN frame into the aggregated CanReadData struct.
+/// IDs are already masked (29-bit, no 0x80000000 flag).
+fn decode_can_frame(data: &mut CanReadData, id: u32, payload: &[u8], len: u8) {
+    let n = len as usize;
+    match id {
+        // MCU_ANALOG_FUEL_CELL (DBC ID 0x80000004 → 0x04)
+        0x04 if n >= 6 => {
+            // fc_output_current: start_bit=0, length=16, LE, signed, factor=0.001
+            let raw = i16::from_le_bytes([payload[0], payload[1]]);
+            data.fc_output_current = raw as f64 * 0.001;
+            // fc_output_voltage: start_bit=16, length=16, LE, signed, factor=0.001
+            let raw = i16::from_le_bytes([payload[2], payload[3]]);
+            data.fc_output_voltage = raw as f64 * 0.001;
+            // h2_high_pressure: start_bit=32, length=16, LE, unsigned, factor=0.1
+            let raw = u16::from_le_bytes([payload[4], payload[5]]);
+            data.h2_high_pressure = raw as f64 * 0.1;
+        }
+        // MCU_ANALOG_POWERTRAIN (DBC ID 0x80000005 → 0x05)
+        0x05 if n >= 8 => {
+            let raw = i16::from_le_bytes([payload[0], payload[1]]);
+            data.sc_voltage = raw as f64 * 0.001;
+            let raw = i16::from_le_bytes([payload[2], payload[3]]);
+            data.sc_current = raw as f64 * 0.01;
+            let raw = i16::from_le_bytes([payload[4], payload[5]]);
+            data.mc_supply_current = raw as f64 * 0.001;
+            let raw = i16::from_le_bytes([payload[6], payload[7]]);
+            data.mc_supply_voltage = raw as f64 * 0.001;
+        }
+        // MCU_ANALOG_ACCESSORY (DBC ID 0x80000006 → 0x06)
+        0x06 if n >= 4 => {
+            let raw = i16::from_le_bytes([payload[0], payload[1]]);
+            data.ab_current = raw as f64 * 0.001;
+            let raw = i16::from_le_bytes([payload[2], payload[3]]);
+            data.ab_voltage = raw as f64 * 0.001;
+        }
+        // MCU_ANALOG_DRIVE (DBC ID 0x80000007 → 0x07)
+        0x07 if n >= 4 => {
+            let raw = u16::from_le_bytes([payload[0], payload[1]]);
+            data.rpm = raw as f64; // factor=1
+            let raw = u16::from_le_bytes([payload[2], payload[3]]);
+            data.speed = raw as f64 * 0.01;
+        }
+        // MCU_STATE (DBC ID 0x80000000 → 0x00)
+        0x00 if n >= 2 => {
+            data.mcu_status = payload[0] & 0x0F;
+            data.vehicle_type = (payload[0] >> 4) & 0x0F;
+            data.motor_controller_enabled = (payload[1] & 0x40) != 0; // bit 14
+            data.main_valve_enabled = (payload[1] & 0x80) != 0; // bit 15
+        }
+        // PROTIUM_POWER (DBC ID 0x80000100 → 0x100)
+        0x100 if n >= 8 => {
+            let raw = i16::from_le_bytes([payload[0], payload[1]]);
+            data.fc_output_voltage = raw as f64 * 0.01; // FC_V
+            let raw = i16::from_le_bytes([payload[2], payload[3]]);
+            data.fc_output_current = raw as f64 * 0.01; // FC_A
+            let raw = i16::from_le_bytes([payload[4], payload[5]]);
+            data.fc_w = raw as f64; // FC_W, factor=1
+            let raw = u16::from_le_bytes([payload[6], payload[7]]);
+            data.energy_wh = raw as f64; // ENERGY_WH, factor=1
+        }
+        // FCCU_POWER (DBC ID 0x80000103 → 0x103)
+        0x103 if n >= 8 => {
+            let raw = i16::from_le_bytes([payload[0], payload[1]]);
+            data.fccu_fc_voltage = raw as f64 * 0.01;
+            let raw = i16::from_le_bytes([payload[2], payload[3]]);
+            data.fccu_fc_current = raw as f64 * 0.01;
+            let raw = i16::from_le_bytes([payload[4], payload[5]]);
+            data.fccu_dcdc_voltage = raw as f64 * 0.01;
+            let raw = i16::from_le_bytes([payload[6], payload[7]]);
+            data.fccu_dcdc_current = raw as f64 * 0.01;
+        }
+        // FCCU_ENVIRONMENT (DBC ID 0x80000104 → 0x104)
+        0x104 if n >= 8 => {
+            let raw = i16::from_le_bytes([payload[0], payload[1]]);
+            data.fc_temp = raw as f64 * 0.01;
+            let raw = i16::from_le_bytes([payload[2], payload[3]]);
+            data.ambient_temp = raw as f64 * 0.01;
+            let raw = u16::from_le_bytes([payload[4], payload[5]]);
+            data.ambient_humidity = raw as f64 * 0.01;
+            // pressure at bytes 6-7 — not mapped in CanReadData currently
+        }
+        _ => {} // Unknown or short frame — ignore
+    }
+}
+
 // ── CAN receive stream (CAN tab) ──
 
-fn start_can_stream(app_handle: AppHandle) {
+fn start_can_stream(app_handle: AppHandle, pcan: Option<Arc<PcanDriver>>) {
     tauri::async_runtime::spawn(async move {
-        // TODO: Replace with actual CAN interface initialization
-        // For Linux: use socketcan crate with "can0" interface
-        // For Windows: use your USB-CAN adapter's library (PCAN, Kvaser, etc.)
-        //
-        // Example with socketcan (Linux only):
-        //   let socket = CANSocket::open("can0").expect("Failed to open CAN interface");
-        //   loop {
-        //       let frame = socket.read_frame().unwrap();
-        //       match frame.id() {
-        //           0x80000004 => { /* MCU_ANALOG_FUEL_CELL */ }
-        //           0x80000005 => { /* MCU_ANALOG_POWERTRAIN */ }
-        //           ...
-        //       }
-        //   }
+        let driver = match pcan {
+            Some(d) => d,
+            None => {
+                eprintln!("[CAN] Brak adaptera PCAN — stream CAN nie zostanie uruchomiony.");
+                return;
+            }
+        };
 
-        println!("[CAN] Stream CAN nie jest jeszcze podłączony do sprzętu.");
-        println!("[CAN] Emitowanie danych testowych co 500ms...");
+        println!("[CAN] Stream CAN uruchomiony — odczyt z PCAN-USB");
 
-        let mut tick: f64 = 0.0;
+        let mut accumulated = CanReadData::default();
 
         loop {
-            // Simulated CAN data for development/testing
-            let data = CanReadData {
-                fc_output_voltage: 48.0 + (tick * 0.1).sin() * 2.0,
-                fc_output_current: 12.0 + (tick * 0.15).sin() * 3.0,
-                h2_high_pressure: 350.0 - tick * 0.5 % 50.0,
-                sc_voltage: 24.0 + (tick * 0.08).sin() * 1.5,
-                sc_current: 5.0 + (tick * 0.12).sin() * 2.0,
-                mc_supply_voltage: 48.0 + (tick * 0.07).cos() * 1.0,
-                mc_supply_current: 8.0 + (tick * 0.1).cos() * 2.0,
-                ab_voltage: 12.5 + (tick * 0.05).sin() * 0.5,
-                ab_current: 2.0 + (tick * 0.09).sin() * 1.0,
-                rpm: 3500.0 + (tick * 0.2).sin() * 500.0,
-                speed: 25.0 + (tick * 0.2).sin() * 5.0,
-                fccu_fc_voltage: 48.0 + (tick * 0.1).sin() * 2.0,
-                fccu_fc_current: 12.0 + (tick * 0.15).sin() * 3.0,
-                fccu_dcdc_voltage: 24.0 + (tick * 0.08).cos() * 1.0,
-                fccu_dcdc_current: 4.0 + (tick * 0.12).cos() * 1.5,
-                fc_temp: 65.0 + (tick * 0.03).sin() * 5.0,
-                ambient_temp: 22.0 + (tick * 0.01).sin() * 2.0,
-                ambient_humidity: 45.0 + (tick * 0.02).sin() * 10.0,
-                fc_w: 580.0 + (tick * 0.1).sin() * 100.0,
-                energy_wh: tick * 0.16,
-                mcu_status: 4,  // RUNNING
-                vehicle_type: 0, // HYDROS_V1
-                motor_controller_enabled: true,
-                main_valve_enabled: true,
-            };
+            // Drain all available frames from the receive buffer
+            let mut frames_read = 0u32;
+            loop {
+                match driver.read() {
+                    Ok(Some(msg)) => {
+                        let can_id = msg.id & 0x1FFFFFFF; // mask to 29-bit
+                        decode_can_frame(
+                            &mut accumulated,
+                            can_id,
+                            &msg.data,
+                            msg.len,
+                        );
+                        frames_read += 1;
+                        // Safety limit to prevent blocking forever if bus is very busy
+                        if frames_read >= 500 {
+                            break;
+                        }
+                    }
+                    Ok(None) => break, // buffer empty
+                    Err(err) => {
+                        eprintln!("[CAN] Read error: 0x{:05X}", err);
+                        // Small delay before retry on error
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        break;
+                    }
+                }
+            }
 
-            let _ = app_handle.emit("can-data-update", data);
-            tick += 0.5;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Emit accumulated data to frontend at ~20 Hz
+            let _ = app_handle.emit("can-data-update", accumulated.clone());
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
 }
 
 // ── CAN send commands ──
 
-/// Send FCCU commands (single-bit toggles)
-/// DBC messages: FCCU_SYSTEM_ENABLE, FCCU_MAIN_VALVE_COMMAND, FCCU_MANUAL_PURGE, FCCU_FAN
+/// Send a single FCCU command (instant toggle).
+/// command_type: "system_enable" | "main_valve" | "manual_purge" | "fan_on"
+/// state: true = ON (0x01), false = OFF (0x00)
 #[tauri::command]
-fn send_fccu_commands(
-    system_enable: bool,
-    main_valve: bool,
-    manual_purge: bool,
-    fan_on: bool,
+fn send_fccu_command(
+    command_type: String,
+    state: bool,
+    can_state: State<'_, CanState>,
 ) -> Result<String, String> {
-    // Build CAN frames per DBC:
-    // FCCU_SYSTEM_ENABLE  (0x80000210): byte[0] bit 0 = CMD_SYSTEM_ENABLE
-    // FCCU_MAIN_VALVE_CMD (0x80000211): byte[0] bit 0 = CMD_MAIN_VALVE
-    // FCCU_MANUAL_PURGE   (0x80000212): byte[0] bit 0 = CMD_MANUAL_PURGE
-    // FCCU_FAN            (0x80000213): byte[0] bit 0 = CMD_FAN_ON
+    let (can_id, name) = match command_type.as_str() {
+        "system_enable" => (0x210u32, "FCCU_SYSTEM_ENABLE"),
+        "main_valve" => (0x211, "FCCU_MAIN_VALVE_COMMAND"),
+        "manual_purge" => (0x212, "FCCU_MANUAL_PURGE"),
+        "fan_on" => (0x213, "FCCU_FAN"),
+        _ => return Err(format!("Nieznana komenda FCCU: {}", command_type)),
+    };
 
-    let frames = [
-        (0x80000210u32, "FCCU_SYSTEM_ENABLE", system_enable as u8),
-        (0x80000211, "FCCU_MAIN_VALVE_COMMAND", main_valve as u8),
-        (0x80000212, "FCCU_MANUAL_PURGE", manual_purge as u8),
-        (0x80000213, "FCCU_FAN", fan_on as u8),
-    ];
+    let payload = [state as u8];
+    println!(
+        "[CAN TX] {} (0x{:08X}): [0x{:02X}] → {}",
+        name,
+        can_id,
+        payload[0],
+        if state { "ON" } else { "OFF" }
+    );
 
-    for (id, name, value) in &frames {
-        println!("[CAN TX] {} (0x{:08X}): [0x{:02X}]", name, id, value);
-        // TODO: Send actual CAN frame
-        // socket.write_frame(&CANFrame::new(*id, &[*value], true, false).unwrap()).unwrap();
+    if let Some(ref driver) = can_state.0 {
+        driver.write(can_id, &payload).map_err(|e| {
+            format!("CAN write error 0x{:05X} for {}", e, name)
+        })?;
+    } else {
+        println!("[CAN TX] (brak adaptera — ramka nie została wysłana)");
     }
 
     Ok(format!(
-        "Wysłano komendy FCCU: sys={}, valve={}, purge={}, fan={}",
-        system_enable, main_valve, manual_purge, fan_on
+        "{} → {}",
+        name,
+        if state { "ON" } else { "OFF" }
     ))
 }
 
 /// Send FCCU settings
-/// DBC message: FCCU_SETTINGS (0x80000220)
+/// DBC message: FCCU_SETTINGS (0x80000220 → 0x220)
 #[tauri::command]
 fn send_fccu_settings(
     fan_mode: u8,
@@ -240,14 +341,8 @@ fn send_fccu_settings(
     p_gain: u16,
     i_gain: u16,
     d_gain: u16,
+    can_state: State<'_, CanState>,
 ) -> Result<String, String> {
-    // FCCU_SETTINGS (0x80000220), 8 bytes:
-    //   FAN_MODE:          bits 0-1  (2 bits)
-    //   PURGE_INTERVAL_S:  bits 2-15 (14 bits)
-    //   P_GAIN:            bits 16-31
-    //   I_GAIN:            bits 32-47
-    //   D_GAIN:            bits 48-63
-
     let byte0_1: u16 = (fan_mode as u16 & 0x03) | ((purge_interval & 0x3FFF) << 2);
     let data: [u8; 8] = [
         (byte0_1 & 0xFF) as u8,
@@ -261,12 +356,17 @@ fn send_fccu_settings(
     ];
 
     println!(
-        "[CAN TX] FCCU_SETTINGS (0x80000220): {:02X?}  (fan_mode={}, purge={}s, P={}, I={}, D={})",
+        "[CAN TX] FCCU_SETTINGS (0x220): {:02X?}  (fan_mode={}, purge={}s, P={}, I={}, D={})",
         data, fan_mode, purge_interval, p_gain, i_gain, d_gain
     );
 
-    // TODO: Send actual CAN frame
-    // socket.write_frame(&CANFrame::new(0x80000220, &data, true, false).unwrap()).unwrap();
+    if let Some(ref driver) = can_state.0 {
+        driver
+            .write(0x220, &data)
+            .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_SETTINGS", e))?;
+    } else {
+        println!("[CAN TX] (brak adaptera — ramka nie została wysłana)");
+    }
 
     Ok(format!(
         "Wysłano FCCU Settings: fan_mode={}, purge={}s, PID=({},{},{})",
@@ -275,7 +375,7 @@ fn send_fccu_settings(
 }
 
 /// Send MCU lighting commands
-/// DBC message: MCU_LIGHTING (0x80000100)
+/// DBC message: MCU_LIGHTING (0x80000100 → 0x100)
 #[tauri::command]
 fn send_lighting(
     headlight: bool,
@@ -284,15 +384,8 @@ fn send_lighting(
     left_indicator: bool,
     right_indicator: bool,
     hazard: bool,
+    can_state: State<'_, CanState>,
 ) -> Result<String, String> {
-    // MCU_LIGHTING (0x80000100), 1 byte:
-    //   HEADLIGHT:       bit 0
-    //   POSITION_LIGHT:  bit 1
-    //   BRAKE_LIGHT:     bit 2
-    //   LEFT_INDICATOR:  bit 3
-    //   RIGHT_INDICATOR: bit 4
-    //   HAZARD:          bit 5
-
     let byte0: u8 = (headlight as u8)
         | ((position_light as u8) << 1)
         | ((brake_light as u8) << 2)
@@ -301,12 +394,17 @@ fn send_lighting(
         | ((hazard as u8) << 5);
 
     println!(
-        "[CAN TX] MCU_LIGHTING (0x80000100): [0x{:02X}]  H={} P={} B={} L={} R={} Hz={}",
+        "[CAN TX] MCU_LIGHTING (0x100): [0x{:02X}]  H={} P={} B={} L={} R={} Hz={}",
         byte0, headlight, position_light, brake_light, left_indicator, right_indicator, hazard
     );
 
-    // TODO: Send actual CAN frame
-    // socket.write_frame(&CANFrame::new(0x80000100, &[byte0], true, false).unwrap()).unwrap();
+    if let Some(ref driver) = can_state.0 {
+        driver
+            .write(0x100, &[byte0])
+            .map_err(|e| format!("CAN write error 0x{:05X} for MCU_LIGHTING", e))?;
+    } else {
+        println!("[CAN TX] (brak adaptera — ramka nie została wysłana)");
+    }
 
     Ok(format!(
         "Wysłano Lighting: H={} P={} B={} L={} R={} Hz={}",
@@ -323,7 +421,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            send_fccu_commands,
+            send_fccu_command,
             send_fccu_settings,
             send_lighting,
         ])
@@ -331,8 +429,27 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let can_handle = app.handle().clone();
 
+            // Start PostgreSQL stream (Grafana tab)
             start_pg_stream(app_handle);
-            start_can_stream(can_handle);
+
+            // Try to initialize PCAN-USB adapter
+            let pcan_arc = match PcanDriver::new(PCAN_USBBUS1, PCAN_BAUD_500K) {
+                Ok(driver) => {
+                    println!("[PCAN] Adapter PCAN-USB zainicjalizowany pomyślnie!");
+                    Some(Arc::new(driver))
+                }
+                Err(e) => {
+                    eprintln!("[PCAN] Nie udało się zainicjalizować adaptera: {}", e);
+                    eprintln!("[PCAN] Zakładka CAN będzie nieaktywna (brak odczytu/zapisu).");
+                    None
+                }
+            };
+
+            // Manage PCAN state for commands
+            app.manage(CanState(pcan_arc.clone()));
+
+            // Start CAN receive stream
+            start_can_stream(can_handle, pcan_arc);
 
             Ok(())
         })
