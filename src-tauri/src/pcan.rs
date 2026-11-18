@@ -7,6 +7,25 @@ use std::fmt;
 // ── PCAN Constants ──
 
 pub const PCAN_USBBUS1: u16 = 0x51;
+pub const PCAN_USBBUS2: u16 = 0x52;
+pub const PCAN_USBBUS3: u16 = 0x53;
+pub const PCAN_USBBUS4: u16 = 0x54;
+pub const PCAN_USBBUS5: u16 = 0x55;
+pub const PCAN_USBBUS6: u16 = 0x56;
+pub const PCAN_USBBUS7: u16 = 0x57;
+pub const PCAN_USBBUS8: u16 = 0x58;
+
+pub const PCAN_USB_CHANNELS: [u16; 8] = [
+    PCAN_USBBUS1,
+    PCAN_USBBUS2,
+    PCAN_USBBUS3,
+    PCAN_USBBUS4,
+    PCAN_USBBUS5,
+    PCAN_USBBUS6,
+    PCAN_USBBUS7,
+    PCAN_USBBUS8,
+];
+
 pub const PCAN_BAUD_500K: u16 = 0x001C;
 pub const PCAN_MESSAGE_EXTENDED: u8 = 0x02;
 pub const PCAN_ERROR_OK: u32 = 0x00000;
@@ -79,7 +98,14 @@ impl fmt::Display for PcanError {
 
 impl PcanDriver {
     /// Load PCANBasic.dll, initialize the given channel at the given baudrate.
+    #[allow(dead_code)]
     pub fn new(channel: u16, baudrate: u16) -> Result<Self, PcanError> {
+        Self::new_auto(Some(channel), baudrate)
+    }
+
+    /// Load PCANBasic.dll and auto-scan USB channels (starting with preferred_channel if provided),
+    /// binding to the first available channel.
+    pub fn new_auto(preferred_channel: Option<u16>, baudrate: u16) -> Result<Self, PcanError> {
         let lib = unsafe { Library::new("PCANBasic.dll") }.map_err(|e| PcanError {
             code: 0xFFFFFFFF,
             message: format!("Nie można załadować PCANBasic.dll: {}", e),
@@ -117,30 +143,51 @@ impl PcanDriver {
                 })?;
         }
 
-        // CAN_Initialize(channel, baudrate, hw_type=0, io_port=0, interrupt=0)
-        let status = unsafe { fn_init(channel, baudrate, 0, 0, 0) };
-        if status != PCAN_ERROR_OK {
-            return Err(PcanError {
-                code: status,
-                message: format!(
-                    "CAN_Initialize failed for channel 0x{:02X}, baud 0x{:04X}",
-                    channel, baudrate
-                ),
-            });
+        // Build list of candidate channels
+        let mut candidates = Vec::new();
+        if let Some(pref) = preferred_channel {
+            candidates.push(pref);
+        }
+        for &ch in &PCAN_USB_CHANNELS {
+            if !candidates.contains(&ch) {
+                candidates.push(ch);
+            }
         }
 
-        println!(
-            "[PCAN] Initialized channel 0x{:02X} @ baudrate 0x{:04X}",
-            channel, baudrate
-        );
+        let mut last_err = 0u32;
+        for &channel in &candidates {
+            let status = unsafe { fn_init(channel, baudrate, 0, 0, 0) };
+            if status == PCAN_ERROR_OK {
+                println!(
+                    "[PCAN] Znaleziono i zainicjalizowano wolny adapter na kanale 0x{:02X} (PCAN_USBBUS{}) @ baudrate 0x{:04X}",
+                    channel,
+                    (channel.saturating_sub(0x50)),
+                    baudrate
+                );
+                return Ok(Self {
+                    _lib: lib,
+                    channel,
+                    fn_read,
+                    fn_write,
+                    fn_uninit,
+                });
+            } else {
+                last_err = status;
+            }
+        }
 
-        Ok(Self {
-            _lib: lib,
-            channel,
-            fn_read,
-            fn_write,
-            fn_uninit,
+        Err(PcanError {
+            code: last_err,
+            message: format!(
+                "Nie udało się zainicjalizować żadnego kanału PCAN-USB (próbowano kanałów 0x{:02X}..0x{:02X}, ost. kod błędu: 0x{:05X})",
+                PCAN_USBBUS1, PCAN_USBBUS8, last_err
+            ),
         })
+    }
+
+    /// Return the active PCAN channel.
+    pub fn channel(&self) -> u16 {
+        self.channel
     }
 
     /// Read a single CAN message from the receive buffer.
