@@ -1,13 +1,33 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { listen } from '@tauri-apps/api/event';
-  import { invoke } from '@tauri-apps/api/core';
   import Plotly from 'plotly.js-dist-min';
+  import {
+    type DataSource,
+    type CurrentReadings,
+    type MetricThresholds,
+    type FccuCommandType,
+    type FccuCommandsState,
+    type FccuSettings,
+    type LightingState,
+    type CanStatistics,
+    FccuState,
+    FccuFanMode,
+    fmtVal,
+    getStatus,
+    calcAvg,
+    calcRms,
+    getFccuStateLabel,
+    getFccuStateColor,
+    plotlyOptions,
+    createGrafanaChartsConfig,
+    createCanChartConfigs
+  } from '$lib';
+  import * as api from '$lib/services/api';
 
-  let selectedSource = 'CAN';
-  const sources = ['Grafana', 'CAN'];
+  let selectedSource: DataSource = 'CAN';
+  const sources: readonly DataSource[] = ['Grafana', 'CAN'];
 
-  const thresholds = {
+  const thresholds: MetricThresholds = {
     voltage: { min: 40, max: 52 },
     current: { min: 0, max: 15 },
     temperature: { min: 0, max: 75 },
@@ -15,7 +35,7 @@
     power: { min: 0, max: 1000 }
   };
 
-  let currentReadings = {
+  let currentReadings: CurrentReadings = {
     voltage1: 0,
     voltage2: 0,
     voltage3: 0,
@@ -31,149 +51,44 @@
 
   const MAX_POINTS = 60;
 
-  function fmtVal(v: number | undefined | null, decimals: number = 2): string {
-    if (v === undefined || v === null || isNaN(v)) return (0).toFixed(decimals).replace('.', ',');
-    return v.toFixed(decimals).replace('.', ',');
-  }
-
-  function getStatus(value: number, config: { min: number, max: number }) {
-    if (value === 0) return 'normal';
-    if (value < config.min || value > config.max) return 'alarm';
-    if (value > config.max * 0.9 || value < config.min * 1.1) return 'warning';
-    return 'normal';
-  }
-
-  const baseLayout = {
-    margin: { t: 10, r: 10, l: 40, b: 30 },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
-    font: { color: '#a1a1aa', size: 11, family: 'system-ui, sans-serif' },
-    xaxis: { gridcolor: '#27272a', zeroline: false, tickfont: { color: '#71717a' } },
-    yaxis: { gridcolor: '#27272a', zeroline: false, tickfont: { color: '#71717a' } },
-    showlegend: true,
-    legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' },
-    hovermode: 'x unified'
-  };
-
-  const plotlyOptions = { responsive: true, displayModeBar: false };
-
   // ── Grafana tab chart refs ──
-  let voltChart: HTMLElement;
-  let currChart: HTMLElement;
-  let tempChart: HTMLElement;
-  let rpmChart: HTMLElement;
-  let powerChart: HTMLElement;
+  let voltChart: HTMLElement | undefined;
+  let currChart: HTMLElement | undefined;
+  let tempChart: HTMLElement | undefined;
+  let rpmChart: HTMLElement | undefined;
+  let powerChart: HTMLElement | undefined;
   let grafanaChartsInitialized = false;
 
-  const grafanaCharts = {
-    voltages: {
-      data: [
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 1 (V)', line: { color: '#3b82f6', width: 2 } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 2 (V)', line: { color: '#60a5fa', width: 2, dash: 'dot' } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Voltage 3 (V)', line: { color: '#93c5fd', width: 2, dash: 'dash' } }
-      ],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Voltage (V)' } }
-    },
-    currents: {
-      data: [
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 1 (A)', line: { color: '#10b981', width: 2 } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 2 (A)', line: { color: '#34d399', width: 2, dash: 'dot' } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Current 3 (A)', line: { color: '#6ee7b7', width: 2, dash: 'dash' } }
-      ],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Current (A)' } }
-    },
-    temperature: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Temperature (°C)', line: { color: '#f59e0b', width: 2 } }],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Temp (°C)' } }
-    },
-    rpm: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'RPM', line: { color: '#8b5cf6', width: 2 } }],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'RPM' } }
-    },
-    power: {
-      data: [
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power 1 (W)', line: { color: '#ec4899', width: 2 } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power 2 (W)', line: { color: '#f472b6', width: 2, dash: 'dot' } },
-        { x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Power 3 (W)', line: { color: '#f9a8d4', width: 2, dash: 'dash' } }
-      ],
-      layout: { ...baseLayout, yaxis: { ...baseLayout.yaxis, title: 'Power (W)' } }
-    }
-  };
+  const grafanaCharts = createGrafanaChartsConfig();
 
   // ── CAN tab chart refs & configs ──
-  let canChart1: HTMLElement;
-  let canChart2: HTMLElement;
+  let canChart1: HTMLElement | undefined;
+  let canChart2: HTMLElement | undefined;
   let canChartsInitialized = false;
 
-  const canChartLayout = {
-    ...baseLayout,
-    margin: { t: 8, r: 8, l: 30, b: 24 },
-    showlegend: false,
-    xaxis: { ...baseLayout.xaxis, title: 'Czas [s]', tickmode: 'linear', dtick: 10, range: [0, 60] },
-    yaxis: { ...baseLayout.yaxis, range: [0, 4] }
-  };
-
-  const canChartConfigs = {
-    chart1: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Napięcie FC (V)', line: { color: '#3b82f6', width: 1.5 } }],
-      layout: { ...canChartLayout, yaxis: { ...canChartLayout.yaxis, title: '' } }
-    },
-    chart2: {
-      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Prąd FC (A)', line: { color: '#3b82f6', width: 1.5 } }],
-      layout: { ...canChartLayout, yaxis: { ...canChartLayout.yaxis, title: '' } }
-    }
-  };
+  const canChartConfigs = createCanChartConfigs();
 
   // CAN tab statistics
-  let canStats = {
+  let canStats: CanStatistics = {
     chart1: { newest: 0, average: 0, rms: 0 },
     chart2: { newest: 0, average: 0, rms: 0 }
   };
   let chart1History: number[] = [];
   let chart2History: number[] = [];
 
-  function calcAvg(arr: number[]): number {
-    if (arr.length === 0) return 0;
-    return arr.reduce((a, b) => a + b, 0) / arr.length;
-  }
-  function calcRms(arr: number[]): number {
-    if (arr.length === 0) return 0;
-    return Math.sqrt(arr.reduce((a, b) => a + b * b, 0) / arr.length);
-  }
-
   // ── CAN Live Device States ──
   let hasCanData = false;
   let canConnected = false;
   let lastCanFrameTime = '---';
-  let fccuState = 3; // 0=INIT, 1=STARTING, 2=RUNNING, 3=STOPPED
+  let fccuState: FccuState | number = FccuState.Stopped; // 0=INIT, 1=STARTING, 2=RUNNING, 3=STOPPED
   let fccuMainValve = false;
   let fccuPurgeValve = false;
   let fccuFanState = false;
   let fccuFanDuty = 0;
   let fccuVersion = '—';
 
-  function getFccuStateLabel(state: number): string {
-    switch (state) {
-      case 0: return 'Inicjalizacja';
-      case 1: return 'Uruchamianie';
-      case 2: return 'Włączony';
-      case 3: return 'Wyłączony';
-      default: return 'Brak odczytu';
-    }
-  }
-
-  function getFccuStateColor(state: number): string {
-    switch (state) {
-      case 0: return '#3b82f6';
-      case 1: return '#f59e0b';
-      case 2: return '#22c55e';
-      case 3: return '#f59e0b'; // Amber yellow matching mockup
-      default: return '#71717a';
-    }
-  }
-
   // ── CAN controls state ──
-  let fccuCmds = {
+  let fccuCmds: FccuCommandsState = {
     systemEnable: false,
     mainValve: false,
     manualPurge: false,
@@ -181,16 +96,18 @@
   };
 
   // FCCU Settings
-  let fccuSettings = {
-    fanMode: 0,         // 0=Ręczny, 1=Liniowy temp., 2=Regulator PID
-    purgeInterval: 60,  // 0-16383 sekund
-    pGain: 100,         // 0-1000
-    iGain: 50,          // 0-1000
-    dGain: 10           // 0-1000
+  let fccuSettings: FccuSettings = {
+    fanMode: FccuFanMode.Manual, // 0=Ręczny, 1=Liniowy temp., 2=Regulator PID
+    purgeInterval: 60,          // 0-16383 sekund
+    pGain: 100,                 // 0-1000
+    iGain: 50,                  // 0-1000
+    dGain: 10                   // 0-1000
   };
 
+  $: isPidEnabled = Number(fccuSettings.fanMode) === FccuFanMode.PidController;
+
   // MCU Lighting
-  let lighting = {
+  let lighting: LightingState = {
     headlight: false,
     positionLight: false,
     brakeLight: false,
@@ -202,13 +119,13 @@
   // CAN send status
   let canSendStatus = '';
 
-  async function toggleFccuCmd(cmdType: string) {
+  async function toggleFccuCmd(cmdType: FccuCommandType) {
     if (cmdType === 'system_enable') fccuCmds.systemEnable = !fccuCmds.systemEnable;
     else if (cmdType === 'main_valve') fccuCmds.mainValve = !fccuCmds.mainValve;
     else if (cmdType === 'manual_purge') fccuCmds.manualPurge = !fccuCmds.manualPurge;
     else if (cmdType === 'fan_on') fccuCmds.fanOn = !fccuCmds.fanOn;
 
-    const stateMap: Record<string, boolean> = {
+    const stateMap: Record<FccuCommandType, boolean> = {
       system_enable: fccuCmds.systemEnable,
       main_valve: fccuCmds.mainValve,
       manual_purge: fccuCmds.manualPurge,
@@ -216,44 +133,28 @@
     };
 
     try {
-      const result = await invoke('send_fccu_command', {
-        commandType: cmdType,
-        state: stateMap[cmdType]
-      });
-      canSendStatus = result as string;
-    } catch (e) {
-      canSendStatus = `Błąd: ${e}`;
+      const result = await api.sendFccuCommand(cmdType, stateMap[cmdType]);
+      canSendStatus = result;
+    } catch (e: unknown) {
+      canSendStatus = `Błąd: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
   async function sendFccuSettings() {
     try {
-      const result = await invoke('send_fccu_settings', {
-        fanMode: fccuSettings.fanMode,
-        purgeInterval: fccuSettings.purgeInterval,
-        pGain: fccuSettings.pGain,
-        iGain: fccuSettings.iGain,
-        dGain: fccuSettings.dGain
-      });
-      canSendStatus = result as string;
-    } catch (e) {
-      canSendStatus = `Błąd: ${e}`;
+      const result = await api.sendFccuSettings(fccuSettings);
+      canSendStatus = result;
+    } catch (e: unknown) {
+      canSendStatus = `Błąd: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
   async function sendLightingCmd() {
     try {
-      const result = await invoke('send_lighting', {
-        headlight: lighting.headlight,
-        positionLight: lighting.positionLight,
-        brakeLight: lighting.brakeLight,
-        leftIndicator: lighting.leftIndicator,
-        rightIndicator: lighting.rightIndicator,
-        hazard: lighting.hazard
-      });
-      canSendStatus = result as string;
-    } catch (e) {
-      canSendStatus = `Błąd: ${e}`;
+      const result = await api.sendLighting(lighting);
+      canSendStatus = result;
+    } catch (e: unknown) {
+      canSendStatus = `Błąd: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
@@ -261,7 +162,7 @@
   async function initGrafanaCharts() {
     if (grafanaChartsInitialized) return;
     await tick();
-    if (!voltChart) return;
+    if (!voltChart || !currChart || !tempChart || !rpmChart || !powerChart) return;
     Plotly.newPlot(voltChart, grafanaCharts.voltages.data, grafanaCharts.voltages.layout, plotlyOptions);
     Plotly.newPlot(currChart, grafanaCharts.currents.data, grafanaCharts.currents.layout, plotlyOptions);
     Plotly.newPlot(tempChart, grafanaCharts.temperature.data, grafanaCharts.temperature.layout, plotlyOptions);
@@ -273,13 +174,13 @@
   async function initCanCharts() {
     if (canChartsInitialized) return;
     await tick();
-    if (!canChart1) return;
+    if (!canChart1 || !canChart2) return;
     Plotly.newPlot(canChart1, canChartConfigs.chart1.data, canChartConfigs.chart1.layout, plotlyOptions);
     Plotly.newPlot(canChart2, canChartConfigs.chart2.data, canChartConfigs.chart2.layout, plotlyOptions);
     canChartsInitialized = true;
   }
 
-  async function switchSource(source: string) {
+  async function switchSource(source: DataSource) {
     selectedSource = source;
     if (source === 'Grafana') {
       grafanaChartsInitialized = false;
@@ -298,14 +199,21 @@
     }
 
     // PostgreSQL stream → Grafana tab
-    const unlistenPg = listen('engine-data-update', (event: any) => {
-      const data = event.payload;
+    const unlistenPgPromise = api.subscribeEngineData((data) => {
       if (selectedSource === 'Grafana') {
         currentReadings = data;
       }
       const now = new Date().toLocaleTimeString();
 
-      if (selectedSource === 'Grafana' && grafanaChartsInitialized && voltChart) {
+      if (
+        selectedSource === 'Grafana' &&
+        grafanaChartsInitialized &&
+        voltChart &&
+        currChart &&
+        tempChart &&
+        rpmChart &&
+        powerChart
+      ) {
         Plotly.extendTraces(voltChart, { x: [[now], [now], [now]], y: [[data.voltage1], [data.voltage2], [data.voltage3]] }, [0, 1, 2], MAX_POINTS);
         Plotly.extendTraces(currChart, { x: [[now], [now], [now]], y: [[data.current1], [data.current2], [data.current3]] }, [0, 1, 2], MAX_POINTS);
         Plotly.extendTraces(tempChart, { x: [[now]], y: [[data.temperature]] }, [0], MAX_POINTS);
@@ -315,8 +223,7 @@
     });
 
     // CAN stream → CAN tab
-    const unlistenCan = listen('can-data-update', (event: any) => {
-      const d = event.payload;
+    const unlistenCanPromise = api.subscribeCanData((d) => {
       const now = new Date().toLocaleTimeString();
 
       if (selectedSource === 'CAN') {
@@ -347,7 +254,7 @@
         };
 
         // Update CAN charts
-        if (canChartsInitialized && canChart1) {
+        if (canChartsInitialized && canChart1 && canChart2) {
           Plotly.extendTraces(canChart1, { x: [[now]], y: [[d.fc_output_voltage ?? 0]] }, [0], MAX_POINTS);
           Plotly.extendTraces(canChart2, { x: [[now]], y: [[d.fc_output_current ?? 0]] }, [0], MAX_POINTS);
 
@@ -365,8 +272,8 @@
     });
 
     return () => {
-      unlistenPg.then(u => u());
-      unlistenCan.then(u => u());
+      unlistenPgPromise.then(u => u());
+      unlistenCanPromise.then(u => u());
     };
   });
 </script>
@@ -662,25 +569,54 @@
                 <span class="setting-form-helper">Czas między cyklami purge</span>
               </div>
 
-              <div class="setting-form-row">
+              <div class="setting-form-row" class:disabled={!isPidEnabled}>
                 <label for="p-gain-input" class="setting-form-label">Wzmocnienie P</label>
-                <input id="p-gain-input" type="number" class="setting-form-input" bind:value={fccuSettings.pGain} min="0" max="1000" />
+                <input
+                  id="p-gain-input"
+                  type="number"
+                  class="setting-form-input"
+                  bind:value={fccuSettings.pGain}
+                  min="0"
+                  max="1000"
+                  disabled={!isPidEnabled}
+                />
                 <span class="setting-form-helper">Część proporcjonalna</span>
               </div>
 
-              <div class="setting-form-row">
+              <div class="setting-form-row" class:disabled={!isPidEnabled}>
                 <label for="i-gain-input" class="setting-form-label">Wzmocnienie I</label>
-                <input id="i-gain-input" type="number" class="setting-form-input" bind:value={fccuSettings.iGain} min="0" max="1000" />
+                <input
+                  id="i-gain-input"
+                  type="number"
+                  class="setting-form-input"
+                  bind:value={fccuSettings.iGain}
+                  min="0"
+                  max="1000"
+                  disabled={!isPidEnabled}
+                />
                 <span class="setting-form-helper">Część całkująca</span>
               </div>
 
-              <div class="setting-form-row">
+              <div class="setting-form-row" class:disabled={!isPidEnabled}>
                 <label for="d-gain-input" class="setting-form-label">Wzmocnienie D</label>
-                <input id="d-gain-input" type="number" class="setting-form-input" bind:value={fccuSettings.dGain} min="0" max="1000" />
+                <input
+                  id="d-gain-input"
+                  type="number"
+                  class="setting-form-input"
+                  bind:value={fccuSettings.dGain}
+                  min="0"
+                  max="1000"
+                  disabled={!isPidEnabled}
+                />
                 <span class="setting-form-helper">Część różniczkująca</span>
               </div>
 
-              <span class="setting-form-footer-note">Nowe wartości wymagają potwierdzenia przez sterownik.</span>
+              <span class="setting-form-footer-note">
+                Nowe wartości wymagają potwierdzenia przez sterownik.
+                {#if !isPidEnabled}
+                  <span class="pid-disabled-hint">Nastawy PID są nieaktywne w tym trybie.</span>
+                {/if}
+              </span>
             </div>
 
             <!-- Prawa kolumna: odczyt wentylatora i przycisk wysłania -->
@@ -1239,6 +1175,19 @@
     display: flex;
     align-items: center;
     gap: 14px;
+    transition: opacity 0.25s ease, filter 0.25s ease;
+  }
+
+  .setting-form-row.disabled {
+    opacity: 0.38;
+    filter: grayscale(0.85);
+  }
+
+  .setting-form-row.disabled .setting-form-label,
+  .setting-form-row.disabled .setting-form-helper {
+    color: #71717a;
+    cursor: not-allowed;
+    user-select: none;
   }
 
   .setting-form-label {
@@ -1277,9 +1226,18 @@
     color: #e4e4e7;
     font-size: 0.85rem;
     outline: none;
+    transition: all 0.2s ease;
   }
 
   .setting-form-input:focus { border-color: #3b82f6; }
+
+  .setting-form-input:disabled {
+    background-color: #1c1c1f;
+    border-color: #27272a;
+    color: #71717a;
+    cursor: not-allowed;
+    box-shadow: none;
+  }
 
   .input-unit-badge {
     font-size: 0.8rem;
@@ -1295,6 +1253,14 @@
     font-size: 0.72rem;
     color: #71717a;
     margin-top: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .pid-disabled-hint {
+    color: #f59e0b;
+    font-size: 0.72rem;
   }
 
   /* Prawa kolumna ustawień (Odczyt wentylatora) */
