@@ -91,6 +91,8 @@
     dGain: 10
   };
 
+  $: isPidEnabled = Number(fccuSettings.fanMode) === 2;
+
   let lighting: LightingState = {
     headlight: false,
     positionLight: false,
@@ -380,23 +382,54 @@
           <span class="setting-form-helper">Czas między cyklami purge</span>
         </div>
 
-        <div class="setting-form-row">
+        <div class="setting-form-row" class:disabled={!isPidEnabled}>
           <label for="p-gain-input" class="setting-form-label">Wzmocnienie P</label>
-          <input id="p-gain-input" type="number" class="setting-form-input" bind:value={fccuSettings.pGain} min="0" max="1000" />
+          <input
+            id="p-gain-input"
+            type="number"
+            class="setting-form-input"
+            bind:value={fccuSettings.pGain}
+            min="0"
+            max="1000"
+            disabled={!isPidEnabled}
+          />
           <span class="setting-form-helper">Część proporcjonalna</span>
         </div>
 
-        <div class="setting-form-row">
+        <div class="setting-form-row" class:disabled={!isPidEnabled}>
           <label for="i-gain-input" class="setting-form-label">Wzmocnienie I</label>
-          <input id="i-gain-input" type="number" class="setting-form-input" bind:value={fccuSettings.iGain} min="0" max="1000" />
+          <input
+            id="i-gain-input"
+            type="number"
+            class="setting-form-input"
+            bind:value={fccuSettings.iGain}
+            min="0"
+            max="1000"
+            disabled={!isPidEnabled}
+          />
           <span class="setting-form-helper">Część całkująca</span>
         </div>
 
-        <div class="setting-form-row">
+        <div class="setting-form-row" class:disabled={!isPidEnabled}>
           <label for="d-gain-input" class="setting-form-label">Wzmocnienie D</label>
-          <input id="d-gain-input" type="number" class="setting-form-input" bind:value={fccuSettings.dGain} min="0" max="1000" />
+          <input
+            id="d-gain-input"
+            type="number"
+            class="setting-form-input"
+            bind:value={fccuSettings.dGain}
+            min="0"
+            max="1000"
+            disabled={!isPidEnabled}
+          />
           <span class="setting-form-helper">Część różniczkująca</span>
         </div>
+
+        {#if !isPidEnabled}
+          <div class="pid-disabled-notice">
+            <span class="pid-disabled-badge">Info</span>
+            <span>Nastawy regulatora PID są nieaktywne w wybranym trybie wentylatora.</span>
+          </div>
+        {/if}
       </div>
 
       <div class="settings-readout-column">
@@ -748,6 +781,21 @@
     display: flex;
     align-items: center;
     gap: 14px;
+    transition: opacity 0.25s ease;
+  }
+
+  .setting-form-row.disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+  }
+
+  .setting-form-row.disabled .setting-form-label {
+    color: #71717a;
+    cursor: not-allowed;
+  }
+
+  .setting-form-row.disabled .setting-form-helper {
+    color: #52525b;
   }
 
   .setting-form-label {
@@ -767,10 +815,44 @@
     font-size: 0.85rem;
     width: 120px;
     outline: none;
+    transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
   }
   .setting-form-select:focus,
   .setting-form-input:focus {
     border-color: #3b82f6;
+  }
+
+  .setting-form-input:disabled {
+    background-color: #18181b;
+    border-color: #27272a;
+    color: #52525b;
+    cursor: not-allowed;
+    box-shadow: none;
+    user-select: none;
+  }
+
+  .pid-disabled-notice {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.73rem;
+    color: #71717a;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background-color: rgba(39, 39, 42, 0.45);
+    border: 1px dashed #3f3f46;
+    margin-top: 4px;
+  }
+
+  .pid-disabled-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background-color: #27272a;
+    color: #a1a1aa;
+    padding: 2px 6px;
+    border-radius: 4px;
   }
 
   .input-unit-wrapper {
