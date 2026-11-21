@@ -423,13 +423,6 @@
           />
           <span class="setting-form-helper">Część różniczkująca</span>
         </div>
-
-        {#if !isPidEnabled}
-          <div class="pid-disabled-notice">
-            <span class="pid-disabled-badge">Info</span>
-            <span>Nastawy regulatora PID są nieaktywne w wybranym trybie wentylatora.</span>
-          </div>
-        {/if}
       </div>
 
       <div class="settings-readout-column">
@@ -829,30 +822,6 @@
     cursor: not-allowed;
     box-shadow: none;
     user-select: none;
-  }
-
-  .pid-disabled-notice {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.73rem;
-    color: #71717a;
-    padding: 6px 10px;
-    border-radius: 6px;
-    background-color: rgba(39, 39, 42, 0.45);
-    border: 1px dashed #3f3f46;
-    margin-top: 4px;
-  }
-
-  .pid-disabled-badge {
-    font-size: 0.65rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    background-color: #27272a;
-    color: #a1a1aa;
-    padding: 2px 6px;
-    border-radius: 4px;
   }
 
   .input-unit-wrapper {
