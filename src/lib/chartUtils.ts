@@ -1,3 +1,5 @@
+import type { PlotLayout, PlotlyConfig } from 'plotly.js-dist-min';
+
 export const MAX_POINTS = 60;
 
 export function fmtVal(v: number | undefined | null, decimals: number = 2): string {
@@ -22,7 +24,7 @@ export function calcRms(arr: number[]): number {
   return Math.sqrt(arr.reduce((a, b) => a + b * b, 0) / arr.length);
 }
 
-export const baseLayout = {
+export const baseLayout: PlotLayout = {
   margin: { t: 10, r: 10, l: 40, b: 30 },
   paper_bgcolor: 'transparent',
   plot_bgcolor: 'transparent',
@@ -34,4 +36,4 @@ export const baseLayout = {
   hovermode: 'x unified'
 };
 
-export const plotlyOptions = { responsive: true, displayModeBar: false };
+export const plotlyOptions: PlotlyConfig = { responsive: true, displayModeBar: false };
