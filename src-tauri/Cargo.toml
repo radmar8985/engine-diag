@@ -26,3 +26,4 @@ tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
 libloading = "0.8"
 dotenvy = "0.15.7"
+can_decode = "0.7.2"

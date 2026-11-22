@@ -160,111 +160,204 @@ fn start_pg_stream(app_handle: AppHandle) {
     });
 }
 
-// ── CAN frame decoder ──
+// ── CAN frame decoder with DBC parser ──
 
-/// Decode a single CAN frame into the aggregated CanReadData struct.
-/// IDs are already masked (29-bit, no 0x80000000 flag).
-fn decode_can_frame(data: &mut CanReadData, id: u32, payload: &[u8], len: u8) {
-    let n = len as usize;
-    match id {
-        // MCU_STATE (DBC ID 0x80000100 → 0x100)
-        0x100 | 0x00 if n >= 2 => {
-            data.mcu_status = payload[0] & 0x0F;
-            data.vehicle_type = (payload[0] >> 4) & 0x0F;
-            data.motor_controller_enabled = (payload[1] & 0x40) != 0; // bit 14
-            data.main_valve_enabled = (payload[1] & 0x80) != 0; // bit 15
+/// Load or parse the vehicle DBC definition using can_decode::Parser.
+pub fn create_dbc_parser() -> can_decode::Parser {
+    let mut parser = can_decode::Parser::new();
+    let loaded = if let Ok(path) = std::env::var("DBC_FILE_PATH") {
+        parser.add_from_dbc_file(std::path::Path::new(&path)).is_ok()
+    } else if std::path::Path::new("can/vehicle.dbc").exists() {
+        parser.add_from_dbc_file(std::path::Path::new("can/vehicle.dbc")).is_ok()
+    } else if std::path::Path::new("src-tauri/can/vehicle.dbc").exists() {
+        parser.add_from_dbc_file(std::path::Path::new("src-tauri/can/vehicle.dbc")).is_ok()
+    } else {
+        false
+    };
+
+    if !loaded {
+        const EMBEDDED_DBC: &str = include_str!("../can/vehicle.dbc");
+        if let Err(e) = parser.add_from_str(EMBEDDED_DBC) {
+            eprintln!("[DBC] Błąd ładowania wbudowanego pliku DBC: {:?}", e);
+        } else {
+            println!(
+                "[DBC] Załadowano wbudowany plik DBC ({} definicji wiadomości)",
+                parser.msg_defs().len()
+            );
         }
-        // MCU_ANALOG_FUEL_CELL (DBC ID 0x80000104 → 0x104)
-        0x104 | 0x04 if n >= 6 => {
-            // fc_output_current: start_bit=0, length=16, LE, signed, factor=0.001
-            let raw = i16::from_le_bytes([payload[0], payload[1]]);
-            data.fc_output_current = raw as f64 * 0.001;
-            // fc_output_voltage: start_bit=16, length=16, LE, signed, factor=0.001
-            let raw = i16::from_le_bytes([payload[2], payload[3]]);
-            data.fc_output_voltage = raw as f64 * 0.001;
-            // h2_high_pressure: start_bit=32, length=16, LE, unsigned, factor=0.1
-            let raw = u16::from_le_bytes([payload[4], payload[5]]);
-            data.h2_high_pressure = raw as f64 * 0.1;
+    } else {
+        println!(
+            "[DBC] Załadowano plik DBC z dysku ({} definicji wiadomości)",
+            parser.msg_defs().len()
+        );
+    }
+
+    parser
+}
+
+/// Decode a single CAN frame into the aggregated CanReadData struct using DBC definitions.
+/// Automatically handles bit unpacking, byte order, signed values, scaling factors, and offsets.
+fn decode_can_frame(
+    parser: &can_decode::Parser,
+    data: &mut CanReadData,
+    id: u32,
+    payload: &[u8],
+) {
+    let mut buf = [0u8; 8];
+    let len = payload.len().min(8);
+    buf[..len].copy_from_slice(&payload[..len]);
+
+    // Check with standard ID, or extended ID (bit 31 set as per DBC extended ID convention)
+    let decoded_msg = parser
+        .decode_msg(id, &buf)
+        .or_else(|| parser.decode_msg(id | (1 << 31), &buf));
+
+    let Some(msg) = decoded_msg else {
+        return;
+    };
+
+    match msg.name.as_str() {
+        "MCU_STATE" => {
+            if let Some(s) = msg.signals.get("STATUS") {
+                data.mcu_status = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
+            }
+            if let Some(s) = msg.signals.get("VEHICLE_TYPE") {
+                data.vehicle_type = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
+            }
+            if let Some(s) = msg.signals.get("MOTOR_CONTROLLER_ENABLED") {
+                data.motor_controller_enabled = s.value.physical > 0.0;
+            }
+            if let Some(s) = msg.signals.get("MAIN_VALVE_ENABLED") {
+                data.main_valve_enabled = s.value.physical > 0.0;
+            }
         }
-        // MCU_ANALOG_POWERTRAIN (DBC ID 0x80000105 → 0x105)
-        0x105 | 0x05 if n >= 8 => {
-            let raw = i16::from_le_bytes([payload[0], payload[1]]);
-            data.sc_voltage = raw as f64 * 0.001;
-            let raw = i16::from_le_bytes([payload[2], payload[3]]);
-            data.sc_current = raw as f64 * 0.01;
-            let raw = i16::from_le_bytes([payload[4], payload[5]]);
-            data.mc_supply_current = raw as f64 * 0.001;
-            let raw = i16::from_le_bytes([payload[6], payload[7]]);
-            data.mc_supply_voltage = raw as f64 * 0.001;
+        "MCU_ANALOG_FUEL_CELL" => {
+            if let Some(s) = msg.signals.get("FUEL_CELL_OUTPUT_CURRENT") {
+                data.fc_output_current = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("FUEL_CELL_OUTPUT_VOLTAGE") {
+                data.fc_output_voltage = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("HYDROGEN_HIGH_PRESSURE") {
+                data.h2_high_pressure = s.value.physical;
+            }
         }
-        // MCU_ANALOG_ACCESSORY (DBC ID 0x80000106 → 0x106)
-        0x106 | 0x06 if n >= 4 => {
-            let raw = i16::from_le_bytes([payload[0], payload[1]]);
-            data.ab_current = raw as f64 * 0.001;
-            let raw = i16::from_le_bytes([payload[2], payload[3]]);
-            data.ab_voltage = raw as f64 * 0.001;
+        "MCU_ANALOG_POWERTRAIN" => {
+            if let Some(s) = msg.signals.get("SUPERCAPACITOR_VOLTAGE") {
+                data.sc_voltage = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("SUPERCAPACITOR_CURRENT") {
+                data.sc_current = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("MOTOR_CONTROLLER_SUPPLY_CURRENT") {
+                data.mc_supply_current = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("MOTOR_CONTROLLER_SUPPLY_VOLTAGE") {
+                data.mc_supply_voltage = s.value.physical;
+            }
         }
-        // MCU_ANALOG_DRIVE (DBC ID 0x80000107 → 0x107)
-        0x107 | 0x07 if n >= 4 => {
-            let raw = u16::from_le_bytes([payload[0], payload[1]]);
-            data.rpm = raw as f64; // factor=1
-            let raw = u16::from_le_bytes([payload[2], payload[3]]);
-            data.speed = raw as f64 * 0.01;
+        "MCU_ANALOG_ACCESSORY" => {
+            if let Some(s) = msg.signals.get("ACCESSORY_BATTERY_CURRENT") {
+                data.ab_current = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("ACCESSORY_BATTERY_VOLTAGE") {
+                data.ab_voltage = s.value.physical;
+            }
         }
-        // PROTIUM_POWER (DBC ID 0x80000200 → 0x200)
-        0x200 if n >= 8 => {
-            let raw = i16::from_le_bytes([payload[0], payload[1]]);
-            data.fc_output_voltage = raw as f64 * 0.01; // FC_V
-            let raw = i16::from_le_bytes([payload[2], payload[3]]);
-            data.fc_output_current = raw as f64 * 0.01; // FC_A
-            let raw = i16::from_le_bytes([payload[4], payload[5]]);
-            data.fc_w = raw as f64; // FC_W, factor=1
-            let raw = u16::from_le_bytes([payload[6], payload[7]]);
-            data.energy_wh = raw as f64; // ENERGY_WH, factor=1
+        "MCU_ANALOG_DRIVE" => {
+            if let Some(s) = msg.signals.get("RPM") {
+                data.rpm = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("SPEED") {
+                data.speed = s.value.physical;
+            }
         }
-        // FCCU_STATE (DBC ID 0x80000500 → 0x500)
-        0x500 if n >= 2 => {
-            data.fccu_state = payload[0] & 0x0F;
-            data.fccu_main_valve = (payload[0] & 0x10) != 0;
-            data.fccu_purge_valve = (payload[0] & 0x20) != 0;
-            data.fccu_fan_state = (payload[0] & 0x40) != 0;
-            data.fccu_fan_duty = payload[1];
+        "PROTIUM_POWER" => {
+            if let Some(s) = msg.signals.get("FC_V") {
+                data.fc_output_voltage = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("FC_A") {
+                data.fc_output_current = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("FC_W") {
+                data.fc_w = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("ENERGY") {
+                data.energy_wh = s.value.physical;
+            }
         }
-        // FCCU_VERSION (DBC ID 0x80000501 → 0x501)
-        0x501 if n >= 3 => {
-            data.fccu_version = format!("v{}.{}.{}", payload[0], payload[1], payload[2]);
+        "FCCU_STATE" => {
+            if let Some(s) = msg.signals.get("STATE") {
+                data.fccu_state = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
+            }
+            if let Some(s) = msg.signals.get("MAIN_VALVE") {
+                data.fccu_main_valve = s.value.physical > 0.0;
+            }
+            if let Some(s) = msg.signals.get("PURGE_VALVE") {
+                data.fccu_purge_valve = s.value.physical > 0.0;
+            }
+            if let Some(s) = msg.signals.get("FAN_STATE") {
+                data.fccu_fan_state = s.value.physical > 0.0;
+            }
+            if let Some(s) = msg.signals.get("FAN_DUTY") {
+                data.fccu_fan_duty = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
+            }
         }
-        // FCCU_HYDROGEN (DBC ID 0x80000502 → 0x502)
-        0x502 if n >= 4 => {
-            let raw = u16::from_le_bytes([payload[0], payload[1]]);
-            data.h2_flow = raw as f64 * 0.01;
-            let raw = u16::from_le_bytes([payload[2], payload[3]]);
-            data.h2_lp_pressure = raw as f64 * 0.01;
+        "FCCU_VERSION" => {
+            let major = msg
+                .signals
+                .get("FIRMWARE_MAJOR")
+                .map(|s| s.value.physical as u8)
+                .unwrap_or(0);
+            let minor = msg
+                .signals
+                .get("FIRMWARE_MINOR")
+                .map(|s| s.value.physical as u8)
+                .unwrap_or(0);
+            let patch = msg
+                .signals
+                .get("FIRMWARE_PATCH")
+                .map(|s| s.value.physical as u8)
+                .unwrap_or(0);
+            data.fccu_version = format!("v{}.{}.{}", major, minor, patch);
         }
-        // FCCU_POWER (DBC ID 0x80000503 → 0x503)
-        0x503 | 0x103 if n >= 8 => {
-            let raw = i16::from_le_bytes([payload[0], payload[1]]);
-            data.fccu_fc_voltage = raw as f64 * 0.01;
-            data.fc_output_voltage = data.fccu_fc_voltage;
-            let raw = i16::from_le_bytes([payload[2], payload[3]]);
-            data.fccu_fc_current = raw as f64 * 0.01;
-            data.fc_output_current = data.fccu_fc_current;
+        "FCCU_HYDROGEN" => {
+            if let Some(s) = msg.signals.get("H2_FLOW") {
+                data.h2_flow = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("H2_LP_PRESSURE") {
+                data.h2_lp_pressure = s.value.physical;
+            }
+        }
+        "FCCU_POWER" => {
+            if let Some(s) = msg.signals.get("FC_VOLTAGE") {
+                data.fccu_fc_voltage = s.value.physical;
+                data.fc_output_voltage = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("FC_CURRENT") {
+                data.fccu_fc_current = s.value.physical;
+                data.fc_output_current = s.value.physical;
+            }
             data.fc_w = data.fc_output_voltage * data.fc_output_current;
-            let raw = i16::from_le_bytes([payload[4], payload[5]]);
-            data.fccu_dcdc_voltage = raw as f64 * 0.01;
-            let raw = i16::from_le_bytes([payload[6], payload[7]]);
-            data.fccu_dcdc_current = raw as f64 * 0.01;
+            if let Some(s) = msg.signals.get("DCDC_VOLTAGE") {
+                data.fccu_dcdc_voltage = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("DCDC_CURRENT") {
+                data.fccu_dcdc_current = s.value.physical;
+            }
         }
-        // FCCU_ENVIRONMENT (DBC ID 0x80000504 → 0x504)
-        0x504 if n >= 6 => {
-            let raw = i16::from_le_bytes([payload[0], payload[1]]);
-            data.fc_temp = raw as f64 * 0.01;
-            let raw = i16::from_le_bytes([payload[2], payload[3]]);
-            data.ambient_temp = raw as f64 * 0.01;
-            let raw = u16::from_le_bytes([payload[4], payload[5]]);
-            data.ambient_humidity = raw as f64 * 0.01;
+        "FCCU_ENVIRONMENT" => {
+            if let Some(s) = msg.signals.get("FC_TEMP_C") {
+                data.fc_temp = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("AMBIENT_TEMP_C") {
+                data.ambient_temp = s.value.physical;
+            }
+            if let Some(s) = msg.signals.get("AMBIENT_HUMIDITY") {
+                data.ambient_humidity = s.value.physical;
+            }
         }
-        _ => {} // Unknown or short frame — ignore
+        _ => {}
     }
 }
 
@@ -282,6 +375,7 @@ fn start_can_stream(app_handle: AppHandle, pcan: Option<Arc<PcanDriver>>) {
 
         println!("[CAN] Stream CAN uruchomiony — odczyt z PCAN-USB");
 
+        let parser = create_dbc_parser();
         let mut accumulated = CanReadData::default();
 
         loop {
@@ -291,11 +385,12 @@ fn start_can_stream(app_handle: AppHandle, pcan: Option<Arc<PcanDriver>>) {
                 match driver.read() {
                     Ok(Some(msg)) => {
                         let can_id = msg.id & 0x1FFFFFFF; // mask to 29-bit
+                        let len = (msg.len as usize).min(msg.data.len());
                         decode_can_frame(
+                            &parser,
                             &mut accumulated,
                             can_id,
-                            &msg.data,
-                            msg.len,
+                            &msg.data[..len],
                         );
                         frames_read += 1;
                         // Safety limit to prevent blocking forever if bus is very busy
@@ -519,4 +614,52 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dbc_parser_loading_and_decoding() {
+        let parser = create_dbc_parser();
+        assert!(!parser.msg_defs().is_empty(), "DBC parser should load messages");
+
+        let mut data = CanReadData::default();
+
+        // Test decoding MCU_ANALOG_FUEL_CELL (0x104):
+        // FUEL_CELL_OUTPUT_CURRENT: start_bit=0, len=16, signed, factor=0.001
+        // FUEL_CELL_OUTPUT_VOLTAGE: start_bit=16, len=16, signed, factor=0.001
+        // HYDROGEN_HIGH_PRESSURE: start_bit=32, len=16, unsigned, factor=0.1
+        let current_raw: i16 = 15200; // 15.2 A
+        let voltage_raw: i16 = 25000; // 25.0 V
+        let pressure_raw: u16 = 3000; // 300.0 bar
+        let mut payload = [0u8; 8];
+        payload[0..2].copy_from_slice(&current_raw.to_le_bytes());
+        payload[2..4].copy_from_slice(&voltage_raw.to_le_bytes());
+        payload[4..6].copy_from_slice(&pressure_raw.to_le_bytes());
+
+        decode_can_frame(&parser, &mut data, 0x104, &payload);
+
+        assert!((data.fc_output_current - 15.2).abs() < 1e-3);
+        assert!((data.fc_output_voltage - 25.0).abs() < 1e-3);
+        assert!((data.h2_high_pressure - 300.0).abs() < 1e-3);
+
+        // Test decoding FCCU_STATE (0x500):
+        // STATE: 0|4@1+ (1,0)
+        // MAIN_VALVE: 4|1@1+ (1,0)
+        // PURGE_VALVE: 5|1@1+ (1,0)
+        // FAN_STATE: 6|1@1+ (1,0)
+        // FAN_DUTY: 8|8@1+ (1,0)
+        let state_byte = 2 | (1 << 4) | (1 << 6); // state=2 (RUNNING), main_valve=1, fan=1
+        let duty_byte = 75u8;
+        let payload2 = [state_byte, duty_byte, 0, 0, 0, 0, 0, 0];
+        decode_can_frame(&parser, &mut data, 0x500, &payload2);
+
+        assert_eq!(data.fccu_state, 2);
+        assert!(data.fccu_main_valve);
+        assert!(!data.fccu_purge_valve);
+        assert!(data.fccu_fan_state);
+        assert_eq!(data.fccu_fan_duty, 75);
+    }
 }
