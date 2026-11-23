@@ -76,12 +76,26 @@
     }
   }
 
-  let fccuCmds = {
-    systemEnable: false,
-    mainValve: false,
-    manualPurge: false,
-    fanOn: false
+  type FccuCmdKey = 'system_enable' | 'main_valve' | 'manual_purge' | 'fan_on';
+
+  let pendingCmds: Record<FccuCmdKey, boolean> = {
+    system_enable: false,
+    main_valve: false,
+    manual_purge: false,
+    fan_on: false
   };
+
+  let pendingTimeouts: Record<FccuCmdKey, ReturnType<typeof setTimeout> | null> = {
+    system_enable: null,
+    main_valve: null,
+    manual_purge: null,
+    fan_on: null
+  };
+
+  let expectedStates: Partial<Record<FccuCmdKey, boolean>> = {};
+
+  let isSendingSettings = false;
+  let isSendingLighting = false;
 
   let fccuSettings: FccuSettings = {
     fanMode: 0,
@@ -117,31 +131,52 @@
     }, 2800);
   }
 
-  async function toggleFccuCmd(cmdType: string) {
-    if (cmdType === 'system_enable') fccuCmds.systemEnable = !fccuCmds.systemEnable;
-    else if (cmdType === 'main_valve') fccuCmds.mainValve = !fccuCmds.mainValve;
-    else if (cmdType === 'manual_purge') fccuCmds.manualPurge = !fccuCmds.manualPurge;
-    else if (cmdType === 'fan_on') fccuCmds.fanOn = !fccuCmds.fanOn;
+  async function toggleFccuCmd(cmdType: FccuCmdKey) {
+    if (pendingCmds[cmdType]) return;
 
-    const stateMap: Record<string, boolean> = {
-      system_enable: fccuCmds.systemEnable,
-      main_valve: fccuCmds.mainValve,
-      manual_purge: fccuCmds.manualPurge,
-      fan_on: fccuCmds.fanOn
-    };
+    let targetState = false;
+    if (cmdType === 'system_enable') {
+      targetState = !(fccuState === 2);
+    } else if (cmdType === 'main_valve') {
+      targetState = !fccuMainValve;
+    } else if (cmdType === 'manual_purge') {
+      targetState = !fccuPurgeValve;
+    } else if (cmdType === 'fan_on') {
+      targetState = !fccuFanState;
+    }
+
+    pendingCmds = { ...pendingCmds, [cmdType]: true };
+    expectedStates[cmdType] = targetState;
+
+    if (pendingTimeouts[cmdType]) {
+      clearTimeout(pendingTimeouts[cmdType]!);
+    }
+    pendingTimeouts[cmdType] = setTimeout(() => {
+      if (pendingCmds[cmdType]) {
+        pendingCmds = { ...pendingCmds, [cmdType]: false };
+        delete expectedStates[cmdType];
+        showToast('Brak potwierdzenia z magistrali CAN (timeout)', true);
+      }
+    }, 4000);
 
     try {
       const result = await invoke('send_fccu_command', {
         commandType: cmdType,
-        state: stateMap[cmdType]
+        state: targetState
       });
       showToast(result as string, false);
     } catch (e) {
+      if (pendingTimeouts[cmdType]) {
+        clearTimeout(pendingTimeouts[cmdType]!);
+      }
+      pendingCmds = { ...pendingCmds, [cmdType]: false };
+      delete expectedStates[cmdType];
       showToast(`Błąd: ${e}`, true);
     }
   }
 
   async function sendFccuSettings() {
+    isSendingSettings = true;
     try {
       const result = await invoke('send_fccu_settings', {
         fanMode: fccuSettings.fanMode,
@@ -153,10 +188,15 @@
       showToast(result as string, false);
     } catch (e) {
       showToast(`Błąd: ${e}`, true);
+    } finally {
+      setTimeout(() => {
+        isSendingSettings = false;
+      }, 500);
     }
   }
 
   async function sendLightingCmd() {
+    isSendingLighting = true;
     try {
       const result = await invoke('send_lighting', {
         headlight: lighting.headlight,
@@ -169,6 +209,10 @@
       showToast(result as string, false);
     } catch (e) {
       showToast(`Błąd: ${e}`, true);
+    } finally {
+      setTimeout(() => {
+        isSendingLighting = false;
+      }, 500);
     }
   }
 
@@ -185,10 +229,50 @@
 
       hasCanData = true;
 
-      if (d.fccu_state !== undefined) fccuState = d.fccu_state;
-      if (d.fccu_main_valve !== undefined) fccuMainValve = d.fccu_main_valve;
-      if (d.fccu_purge_valve !== undefined) fccuPurgeValve = d.fccu_purge_valve;
-      if (d.fccu_fan_state !== undefined) fccuFanState = d.fccu_fan_state;
+      if (d.fccu_state !== undefined) {
+        fccuState = d.fccu_state;
+        if (pendingCmds.system_enable) {
+          if (expectedStates.system_enable === undefined || (fccuState === 2) === expectedStates.system_enable) {
+            if (pendingTimeouts.system_enable) clearTimeout(pendingTimeouts.system_enable);
+            pendingCmds = { ...pendingCmds, system_enable: false };
+            delete expectedStates.system_enable;
+          }
+        }
+      }
+
+      if (d.fccu_main_valve !== undefined) {
+        fccuMainValve = d.fccu_main_valve;
+        if (pendingCmds.main_valve) {
+          if (expectedStates.main_valve === undefined || fccuMainValve === expectedStates.main_valve) {
+            if (pendingTimeouts.main_valve) clearTimeout(pendingTimeouts.main_valve);
+            pendingCmds = { ...pendingCmds, main_valve: false };
+            delete expectedStates.main_valve;
+          }
+        }
+      }
+
+      if (d.fccu_purge_valve !== undefined) {
+        fccuPurgeValve = d.fccu_purge_valve;
+        if (pendingCmds.manual_purge) {
+          if (expectedStates.manual_purge === undefined || fccuPurgeValve === expectedStates.manual_purge) {
+            if (pendingTimeouts.manual_purge) clearTimeout(pendingTimeouts.manual_purge);
+            pendingCmds = { ...pendingCmds, manual_purge: false };
+            delete expectedStates.manual_purge;
+          }
+        }
+      }
+
+      if (d.fccu_fan_state !== undefined) {
+        fccuFanState = d.fccu_fan_state;
+        if (pendingCmds.fan_on) {
+          if (expectedStates.fan_on === undefined || fccuFanState === expectedStates.fan_on) {
+            if (pendingTimeouts.fan_on) clearTimeout(pendingTimeouts.fan_on);
+            pendingCmds = { ...pendingCmds, fan_on: false };
+            delete expectedStates.fan_on;
+          }
+        }
+      }
+
       if (d.fccu_fan_duty !== undefined) fccuFanDuty = d.fccu_fan_duty;
       if (d.fccu_version && d.fccu_version.trim().length > 0) fccuVersion = d.fccu_version;
 
@@ -210,6 +294,9 @@
 
     return () => {
       unlistenCan.then((u) => u());
+      (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
+        if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
+      });
     };
   });
 </script>
@@ -319,8 +406,18 @@
           <span class="cmd-tile-name">System</span>
           <span class="cmd-tile-state">Stan: {fccuState === 2 ? 'włączony' : 'wyłączony'}</span>
         </div>
-        <button class="action-btn btn-blue" on:click={() => toggleFccuCmd('system_enable')}>
-          {fccuCmds.systemEnable ? 'Wyłącz system' : 'Włącz system'}
+        <button
+          class="action-btn btn-blue"
+          class:is-pending={pendingCmds.system_enable}
+          disabled={pendingCmds.system_enable}
+          on:click={() => toggleFccuCmd('system_enable')}
+        >
+          {#if pendingCmds.system_enable}
+            <span class="btn-spinner"></span>
+            <span>{expectedStates.system_enable ? 'Włączanie...' : 'Wyłączanie...'}</span>
+          {:else}
+            {fccuState === 2 ? 'Wyłącz system' : 'Włącz system'}
+          {/if}
         </button>
       </div>
 
@@ -329,8 +426,18 @@
           <span class="cmd-tile-name">Zawór główny</span>
           <span class="cmd-tile-state">Stan: {fccuMainValve ? 'otwarty' : 'zamknięty'}</span>
         </div>
-        <button class="action-btn btn-grey" on:click={() => toggleFccuCmd('main_valve')}>
-          {fccuCmds.mainValve ? 'Zamknij zawór główny' : 'Otwórz zawór główny'}
+        <button
+          class="action-btn btn-grey"
+          class:is-pending={pendingCmds.main_valve}
+          disabled={pendingCmds.main_valve}
+          on:click={() => toggleFccuCmd('main_valve')}
+        >
+          {#if pendingCmds.main_valve}
+            <span class="btn-spinner"></span>
+            <span>{expectedStates.main_valve ? 'Otwieranie...' : 'Zamykanie...'}</span>
+          {:else}
+            {fccuMainValve ? 'Zamknij zawór główny' : 'Otwórz zawór główny'}
+          {/if}
         </button>
       </div>
 
@@ -339,8 +446,18 @@
           <span class="cmd-tile-name">Przedmuch (purge)</span>
           <span class="cmd-tile-state">Stan: {fccuPurgeValve ? 'aktywny' : 'nieaktywny'}</span>
         </div>
-        <button class="action-btn btn-grey" on:click={() => toggleFccuCmd('manual_purge')}>
-          Uruchom przedmuch
+        <button
+          class="action-btn btn-grey"
+          class:is-pending={pendingCmds.manual_purge}
+          disabled={pendingCmds.manual_purge}
+          on:click={() => toggleFccuCmd('manual_purge')}
+        >
+          {#if pendingCmds.manual_purge}
+            <span class="btn-spinner"></span>
+            <span>{expectedStates.manual_purge ? 'Uruchamianie...' : 'Zatrzymywanie...'}</span>
+          {:else}
+            {fccuPurgeValve ? 'Zatrzymaj przedmuch' : 'Uruchom przedmuch'}
+          {/if}
         </button>
       </div>
 
@@ -349,8 +466,18 @@
           <span class="cmd-tile-name">Wentylator</span>
           <span class="cmd-tile-state">Stan: {fccuFanState ? 'włączony' : 'wyłączony'}</span>
         </div>
-        <button class="action-btn btn-grey" on:click={() => toggleFccuCmd('fan_on')}>
-          {fccuCmds.fanOn ? 'Wyłącz wentylator' : 'Włącz wentylator'}
+        <button
+          class="action-btn btn-grey"
+          class:is-pending={pendingCmds.fan_on}
+          disabled={pendingCmds.fan_on}
+          on:click={() => toggleFccuCmd('fan_on')}
+        >
+          {#if pendingCmds.fan_on}
+            <span class="btn-spinner"></span>
+            <span>{expectedStates.fan_on ? 'Włączanie...' : 'Wyłączanie...'}</span>
+          {:else}
+            {fccuFanState ? 'Wyłącz wentylator' : 'Włącz wentylator'}
+          {/if}
         </button>
       </div>
     </div>
@@ -443,7 +570,9 @@
             <span class="fan-readout-val">{fccuFanDuty ? fccuFanDuty * 30 : 0} obr./min</span>
           </div>
         </div>
-        <button class="blue-submit-btn" on:click={sendFccuSettings}>Wyślij ustawienia</button>
+        <button class="blue-submit-btn" disabled={isSendingSettings} on:click={sendFccuSettings}>
+          {isSendingSettings ? 'Wysyłanie...' : 'Wyślij ustawienia'}
+        </button>
       </div>
     </div>
   </div>
@@ -514,7 +643,9 @@
     </div>
 
     <div class="lighting-action-row">
-      <button class="blue-submit-btn" on:click={sendLightingCmd}>Wyślij oświetlenie</button>
+      <button class="blue-submit-btn" disabled={isSendingLighting} on:click={sendLightingCmd}>
+        {isSendingLighting ? 'Wysyłanie...' : 'Wyślij oświetlenie'}
+      </button>
     </div>
   </div>
 
@@ -740,6 +871,35 @@
     cursor: pointer;
     transition: all 0.2s ease;
     white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+
+  .action-btn:disabled,
+  .action-btn.is-pending {
+    opacity: 0.45;
+    cursor: not-allowed;
+    filter: grayscale(0.6);
+    pointer-events: none;
+  }
+
+  .btn-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-top-color: #ffffff;
+    border-radius: 50%;
+    animation: spin-btn 0.7s linear infinite;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+
+  @keyframes spin-btn {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .btn-blue {
@@ -898,6 +1058,12 @@
     transition: background-color 0.2s;
   }
   .blue-submit-btn:hover { background-color: #2563eb; }
+  .blue-submit-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    filter: grayscale(0.5);
+    pointer-events: none;
+  }
 
   .lighting-grid-layout {
     display: grid;
