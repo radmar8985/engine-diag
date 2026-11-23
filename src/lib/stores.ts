@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import type { EngineData } from './types';
+import type { EngineData, DbStatus } from './types';
 
 export const currentReadings = writable<EngineData>({
   voltage1: 0,
@@ -17,3 +17,8 @@ export const currentReadings = writable<EngineData>({
 
 export const canConnected = writable<boolean>(false);
 export const lastCanFrameTime = writable<string>('---');
+
+export const dbStatus = writable<DbStatus>({
+  connected: false,
+  message: 'Inicjalizacja...'
+});

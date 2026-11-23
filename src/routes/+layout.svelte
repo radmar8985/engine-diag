@@ -2,9 +2,9 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { listen } from '@tauri-apps/api/event';
-  import { currentReadings, canConnected, lastCanFrameTime } from '$lib/stores';
+  import { currentReadings, canConnected, lastCanFrameTime, dbStatus } from '$lib/stores';
   import { fmtVal, getStatus } from '$lib/chartUtils';
-  import type { EngineData, CanReadData } from '$lib/types';
+  import type { EngineData, CanReadData, DbStatus } from '$lib/types';
 
   let { children } = $props();
 
@@ -47,9 +47,14 @@
       }
     });
 
+    const unlistenDb = listen<DbStatus>('db-connection-status', (event) => {
+      dbStatus.set(event.payload);
+    });
+
     return () => {
       unlistenPg.then((u) => u());
       unlistenCan.then((u) => u());
+      unlistenDb.then((u) => u());
     };
   });
 </script>
@@ -157,16 +162,31 @@
     </div>
 
     <div class="section can-comm-section">
-      <h2 class="section-title">Komunikacja CAN</h2>
+      <h2 class="section-title">{isCanTab ? 'Komunikacja CAN' : 'Baza danych'}</h2>
       <div class="can-comm-box">
-        <div class="can-comm-row">
-          <span class="can-comm-label">Połączenie</span>
-          <span class="can-comm-value">{$canConnected ? 'Połączono' : 'Brak informacji'}</span>
-        </div>
-        <div class="can-comm-row">
-          <span class="can-comm-label">Ostatnia ramka</span>
-          <span class="can-comm-value">{$lastCanFrameTime}</span>
-        </div>
+        {#if isCanTab}
+          <div class="can-comm-row">
+            <span class="can-comm-label">Połączenie</span>
+            <span class="can-comm-value">{$canConnected ? 'Połączono' : 'Brak informacji'}</span>
+          </div>
+          <div class="can-comm-row">
+            <span class="can-comm-label">Ostatnia ramka</span>
+            <span class="can-comm-value">{$lastCanFrameTime}</span>
+          </div>
+        {:else}
+          <div class="can-comm-row">
+            <span class="can-comm-label">Połączenie</span>
+            <span class="can-comm-value {$dbStatus.connected ? 'status-text-ok' : 'status-text-err'}">
+              {$dbStatus.connected ? 'Połączono' : 'Rozłączono'}
+            </span>
+          </div>
+          <div class="can-comm-row">
+            <span class="can-comm-label">Status</span>
+            <span class="can-comm-value can-comm-desc" title={$dbStatus.message}>
+              {$dbStatus.message}
+            </span>
+          </div>
+        {/if}
       </div>
     </div>
   </aside>
@@ -372,6 +392,22 @@
   .can-comm-value {
     color: #ffffff;
     font-weight: 500;
+  }
+
+  .status-text-ok {
+    color: #4ade80 !important;
+  }
+
+  .status-text-err {
+    color: #f87171 !important;
+  }
+
+  .can-comm-desc {
+    max-width: 140px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: right;
   }
 
   .charts-area {

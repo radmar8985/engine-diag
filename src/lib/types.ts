@@ -187,3 +187,22 @@ export interface CanStatistics {
   chart1: ChartSeriesStats;
   chart2: ChartSeriesStats;
 }
+
+/**
+ * PostgreSQL / TimescaleDB connection configuration
+ */
+export interface DbConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  dbname: string;
+}
+
+/**
+ * PostgreSQL connection status
+ */
+export interface DbStatus {
+  connected: boolean;
+  message: string;
+}

@@ -2,7 +2,7 @@ mod pcan;
 
 use pcan::{PcanDriver, PCAN_BAUD_500K};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio_postgres::NoTls;
@@ -76,86 +76,217 @@ struct CanReadData {
 
 struct CanState(Option<Arc<PcanDriver>>);
 
+// ── PostgreSQL configuration & state ──
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DbConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub dbname: String,
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "postgres".to_string(),
+            password: "admin".to_string(),
+            dbname: "engine_db".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DbStatus {
+    pub connected: bool,
+    pub message: String,
+}
+
+pub struct DbConfigState {
+    pub tx: tokio::sync::watch::Sender<DbConfig>,
+    pub status: Arc<RwLock<DbStatus>>,
+}
+
+fn load_initial_db_config() -> DbConfig {
+    dotenvy::dotenv().ok();
+    DbConfig {
+        host: std::env::var("PG_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        port: std::env::var("PG_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(5432),
+        user: std::env::var("PG_USER").unwrap_or_else(|_| "postgres".to_string()),
+        password: std::env::var("PG_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
+        dbname: std::env::var("PG_DBNAME").unwrap_or_else(|_| "engine_db".to_string()),
+    }
+}
+
+fn save_db_config_to_env(config: &DbConfig) -> Result<(), String> {
+    std::env::set_var("PG_HOST", &config.host);
+    std::env::set_var("PG_PORT", config.port.to_string());
+    std::env::set_var("PG_USER", &config.user);
+    std::env::set_var("PG_PASSWORD", &config.password);
+    std::env::set_var("PG_DBNAME", &config.dbname);
+
+    let content = format!(
+        "PG_HOST={}\nPG_PORT={}\nPG_USER={}\nPG_PASSWORD={}\nPG_DBNAME={}\n",
+        config.host, config.port, config.user, config.password, config.dbname
+    );
+
+    let paths = [
+        std::path::PathBuf::from(".env"),
+        std::path::PathBuf::from("../.env"),
+    ];
+    let mut written = false;
+    for p in &paths {
+        if p.exists() {
+            if let Ok(()) = std::fs::write(p, &content) {
+                written = true;
+            }
+        }
+    }
+    if !written {
+        std::fs::write(".env", &content).map_err(|e| format!("Błąd zapisu pliku .env: {}", e))?;
+    }
+    Ok(())
+}
+
 // ── PostgreSQL stream (Grafana tab) ──
 
-fn start_pg_stream(app_handle: AppHandle) {
+fn start_pg_stream(
+    app_handle: AppHandle,
+    mut config_rx: tokio::sync::watch::Receiver<DbConfig>,
+    status_arc: Arc<RwLock<DbStatus>>,
+) {
     tauri::async_runtime::spawn(async move {
-        let pg_host = std::env::var("PG_HOST").unwrap_or_else(|_| "localhost".to_string());
-        let pg_port = std::env::var("PG_PORT").unwrap_or_else(|_| "5432".to_string());
-        let pg_user = std::env::var("PG_USER").unwrap_or_else(|_| "postgres".to_string());
-        let pg_password = std::env::var("PG_PASSWORD").unwrap_or_else(|_| "admin".to_string());
-        let pg_dbname = std::env::var("PG_DBNAME").unwrap_or_else(|_| "engine_db".to_string());
+        loop {
+            let current_config = config_rx.borrow_and_update().clone();
+            let conn_string = format!(
+                "host={} port={} user={} password={} dbname={}",
+                current_config.host,
+                current_config.port,
+                current_config.user,
+                current_config.password,
+                current_config.dbname
+            );
 
-        let conn_string = format!(
-            "host={} port={} user={} password={} dbname={}",
-            pg_host, pg_port, pg_user, pg_password, pg_dbname
-        );
+            let status_connecting = DbStatus {
+                connected: false,
+                message: format!("Łączenie z {}:{}...", current_config.host, current_config.port),
+            };
+            if let Ok(mut s) = status_arc.write() {
+                *s = status_connecting.clone();
+            }
+            let _ = app_handle.emit("db-connection-status", status_connecting);
 
-        println!(
-            "Łączenie z PostgreSQL: host={} port={} user={} dbname={}",
-            pg_host, pg_port, pg_user, pg_dbname
-        );
+            println!(
+                "Łączenie z PostgreSQL: host={} port={} user={} dbname={}",
+                current_config.host, current_config.port, current_config.user, current_config.dbname
+            );
 
-        let client = loop {
-            match tokio_postgres::connect(&conn_string, NoTls).await {
-                Ok((client, connection)) => {
+            let connect_result = tokio::select! {
+                res = tokio_postgres::connect(&conn_string, NoTls) => Some(res),
+                _ = config_rx.changed() => None,
+            };
+
+            let client = match connect_result {
+                Some(Ok((client, connection))) => {
                     tokio::spawn(async move {
                         if let Err(e) = connection.await {
                             eprintln!("PostgreSQL connection error: {:?}", e);
                         }
                     });
                     println!("Połączono z PostgreSQL/TimescaleDB!");
-                    break client;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Błąd połączenia z PostgreSQL: {:?}. Ponowna próba za 3s...",
-                        e
-                    );
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                }
-            }
-        };
-
-        loop {
-            let result = client
-                .query_opt(
-                    "SELECT voltage1, voltage2, voltage3, current1, current2, current3, \
-                            power1, power2, power3, temperature, rpm \
-                     FROM sensor_readings \
-                     ORDER BY time DESC \
-                     LIMIT 1",
-                    &[],
-                )
-                .await;
-
-            match result {
-                Ok(Some(row)) => {
-                    let data = EngineData {
-                        voltage1: row.get::<_, Option<f64>>("voltage1").unwrap_or(0.0),
-                        voltage2: row.get::<_, Option<f64>>("voltage2").unwrap_or(0.0),
-                        voltage3: row.get::<_, Option<f64>>("voltage3").unwrap_or(0.0),
-                        current1: row.get::<_, Option<f64>>("current1").unwrap_or(0.0),
-                        current2: row.get::<_, Option<f64>>("current2").unwrap_or(0.0),
-                        current3: row.get::<_, Option<f64>>("current3").unwrap_or(0.0),
-                        power1: row.get::<_, Option<f64>>("power1").unwrap_or(0.0),
-                        power2: row.get::<_, Option<f64>>("power2").unwrap_or(0.0),
-                        power3: row.get::<_, Option<f64>>("power3").unwrap_or(0.0),
-                        temperature: row.get::<_, Option<f64>>("temperature").unwrap_or(0.0),
-                        rpm: row.get::<_, Option<f64>>("rpm").unwrap_or(0.0),
+                    let status_ok = DbStatus {
+                        connected: true,
+                        message: format!("Połączono ({})", current_config.dbname),
                     };
+                    if let Ok(mut s) = status_arc.write() {
+                        *s = status_ok.clone();
+                    }
+                    let _ = app_handle.emit("db-connection-status", status_ok);
+                    client
+                }
+                Some(Err(e)) => {
+                    let err_msg = format!("Błąd połączenia: {}", e);
+                    eprintln!("Błąd połączenia z PostgreSQL: {}. Ponowna próba za 3s...", e);
+                    let status_err = DbStatus {
+                        connected: false,
+                        message: err_msg,
+                    };
+                    if let Ok(mut s) = status_arc.write() {
+                        *s = status_err.clone();
+                    }
+                    let _ = app_handle.emit("db-connection-status", status_err);
 
-                    let _ = app_handle.emit("engine-data-update", data);
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                        _ = config_rx.changed() => {}
+                    }
+                    continue;
                 }
-                Ok(None) => {
-                    eprintln!("Brak danych w tabeli sensor_readings");
+                None => {
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("PostgreSQL query error: {:?}", e);
+            };
+
+            let mut is_connected = true;
+            while is_connected {
+                tokio::select! {
+                    _ = config_rx.changed() => {
+                        println!("Wykryto zmianę konfiguracji bazy danych, zamykanie obecnego połączenia...");
+                        is_connected = false;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        let result = client
+                            .query_opt(
+                                "SELECT voltage1, voltage2, voltage3, current1, current2, current3, \
+                                        power1, power2, power3, temperature, rpm \
+                                 FROM sensor_readings \
+                                 ORDER BY time DESC \
+                                 LIMIT 1",
+                                &[],
+                            )
+                            .await;
+
+                        match result {
+                            Ok(Some(row)) => {
+                                let data = EngineData {
+                                    voltage1: row.get::<_, Option<f64>>("voltage1").unwrap_or(0.0),
+                                    voltage2: row.get::<_, Option<f64>>("voltage2").unwrap_or(0.0),
+                                    voltage3: row.get::<_, Option<f64>>("voltage3").unwrap_or(0.0),
+                                    current1: row.get::<_, Option<f64>>("current1").unwrap_or(0.0),
+                                    current2: row.get::<_, Option<f64>>("current2").unwrap_or(0.0),
+                                    current3: row.get::<_, Option<f64>>("current3").unwrap_or(0.0),
+                                    power1: row.get::<_, Option<f64>>("power1").unwrap_or(0.0),
+                                    power2: row.get::<_, Option<f64>>("power2").unwrap_or(0.0),
+                                    power3: row.get::<_, Option<f64>>("power3").unwrap_or(0.0),
+                                    temperature: row.get::<_, Option<f64>>("temperature").unwrap_or(0.0),
+                                    rpm: row.get::<_, Option<f64>>("rpm").unwrap_or(0.0),
+                                };
+
+                                let _ = app_handle.emit("engine-data-update", data);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!("PostgreSQL query error: {:?}", e);
+                                let status_err = DbStatus {
+                                    connected: false,
+                                    message: format!("Błąd zapytania: {}", e),
+                                };
+                                if let Ok(mut s) = status_arc.write() {
+                                    *s = status_err.clone();
+                                }
+                                let _ = app_handle.emit("db-connection-status", status_err);
+                                is_connected = false;
+                            }
+                        }
+                    }
                 }
             }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
 }
@@ -554,25 +685,76 @@ fn send_lighting(
     ))
 }
 
+#[tauri::command]
+fn get_db_config(state: State<'_, DbConfigState>) -> DbConfig {
+    state.tx.borrow().clone()
+}
+
+#[tauri::command]
+fn get_db_status(state: State<'_, DbConfigState>) -> DbStatus {
+    state
+        .status
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or(DbStatus {
+            connected: false,
+            message: "Nieznany".to_string(),
+        })
+}
+
+#[tauri::command]
+async fn save_db_config(
+    config: DbConfig,
+    state: State<'_, DbConfigState>,
+) -> Result<String, String> {
+    if config.host.trim().is_empty() {
+        return Err("Host nie może być pusty".to_string());
+    }
+    if config.dbname.trim().is_empty() {
+        return Err("Nazwa bazy danych nie może być pusta".to_string());
+    }
+    if config.user.trim().is_empty() {
+        return Err("Użytkownik nie może być pusty".to_string());
+    }
+
+    save_db_config_to_env(&config)?;
+    let _ = state.tx.send(config);
+    Ok("Dane zapisane pomyślnie. Trwa łączenie z bazą...".to_string())
+}
+
 // ── App entry point ──
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    dotenvy::dotenv().ok();
+    let initial_config = load_initial_db_config();
+    let (config_tx, config_rx) = tokio::sync::watch::channel(initial_config);
+    let db_status = Arc::new(RwLock::new(DbStatus {
+        connected: false,
+        message: "Inicjalizacja połączenia...".to_string(),
+    }));
+
+    let db_state = DbConfigState {
+        tx: config_tx,
+        status: db_status.clone(),
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(db_state)
         .invoke_handler(tauri::generate_handler![
             send_fccu_command,
             send_fccu_settings,
             send_lighting,
+            get_db_config,
+            get_db_status,
+            save_db_config,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
             let can_handle = app.handle().clone();
 
             // Start PostgreSQL stream (Grafana tab)
-            start_pg_stream(app_handle);
+            start_pg_stream(app_handle, config_rx, db_status);
 
             // Try to initialize PCAN-USB adapter (auto-detect free channel or read PCAN_CHANNEL env var)
             let preferred_channel = std::env::var("PCAN_CHANNEL").ok().and_then(|v| {
