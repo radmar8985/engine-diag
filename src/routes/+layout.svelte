@@ -8,6 +8,8 @@
 
   let { children } = $props();
 
+  let isCanTab = $derived($page.url.pathname === '/can');
+
   const thresholds = {
     voltage: { min: 40, max: 52 },
     current: { min: 0, max: 15 },
@@ -77,48 +79,69 @@
     <div class="section">
       <h2 class="section-title">Pomiary na żywo</h2>
 
+      <!-- Napięcia -->
       <div class="metric-group">
         <div class="metric-card status-{getStatus($currentReadings.voltage1, thresholds.voltage)}">
           <div class="metric-header"><span class="metric-label">U_FC</span><div class="indicator"></div></div>
           <div class="metric-value">{fmtVal($currentReadings.voltage1, 1)} <span class="unit">V</span></div>
         </div>
-        <div class="metric-card status-{getStatus($currentReadings.voltage2, thresholds.voltage)}">
+        <div
+          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.voltage2, thresholds.voltage)}"
+          class:disabled={isCanTab}
+        >
           <div class="metric-header"><span class="metric-label">U_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.voltage2, 1)} <span class="unit">V</span></div>
+          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.voltage2, 1)} <span class="unit">V</span></div>
         </div>
-        <div class="metric-card status-{getStatus($currentReadings.voltage3, thresholds.voltage)}">
+        <div
+          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.voltage3, thresholds.voltage)}"
+          class:disabled={isCanTab}
+        >
           <div class="metric-header"><span class="metric-label">U_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.voltage3, 1)} <span class="unit">V</span></div>
+          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.voltage3, 1)} <span class="unit">V</span></div>
         </div>
       </div>
 
+      <!-- Prądy -->
       <div class="metric-group">
         <div class="metric-card status-{getStatus($currentReadings.current1, thresholds.current)}">
           <div class="metric-header"><span class="metric-label">I_FC</span><div class="indicator"></div></div>
           <div class="metric-value">{fmtVal($currentReadings.current1, 1)} <span class="unit">A</span></div>
         </div>
-        <div class="metric-card status-{getStatus($currentReadings.current2, thresholds.current)}">
+        <div
+          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.current2, thresholds.current)}"
+          class:disabled={isCanTab}
+        >
           <div class="metric-header"><span class="metric-label">I_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.current2, 1)} <span class="unit">A</span></div>
+          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.current2, 1)} <span class="unit">A</span></div>
         </div>
-        <div class="metric-card status-{getStatus($currentReadings.current3, thresholds.current)}">
+        <div
+          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.current3, thresholds.current)}"
+          class:disabled={isCanTab}
+        >
           <div class="metric-header"><span class="metric-label">I_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.current3, 1)} <span class="unit">A</span></div>
+          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.current3, 1)} <span class="unit">A</span></div>
         </div>
       </div>
 
+      <!-- Moce -->
       <div class="metric-group">
         <div class="metric-card status-{getStatus($currentReadings.power1, thresholds.power)}">
           <div class="metric-header"><span class="metric-label">P_FC</span><div class="indicator"></div></div>
           <div class="metric-value">{fmtVal($currentReadings.power1, 0)} <span class="unit">W</span></div>
         </div>
-        <div class="metric-card status-{getStatus($currentReadings.power2, thresholds.power)}">
+        <div
+          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.power2, thresholds.power)}"
+          class:disabled={isCanTab}
+        >
           <div class="metric-header"><span class="metric-label">P_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.power2, 0)} <span class="unit">W</span></div>
+          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.power2, 0)} <span class="unit">W</span></div>
         </div>
-        <div class="metric-card status-{getStatus($currentReadings.power3, thresholds.power)}">
+        <div
+          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.power3, thresholds.power)}"
+          class:disabled={isCanTab}
+        >
           <div class="metric-header"><span class="metric-label">P_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.power3, 0)} <span class="unit">W</span></div>
+          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.power3, 0)} <span class="unit">W</span></div>
         </div>
       </div>
 
@@ -269,6 +292,27 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    transition: opacity 0.25s ease, background-color 0.25s ease, border-color 0.25s ease;
+  }
+
+  .metric-card.disabled {
+    opacity: 0.38;
+    background-color: #121214;
+    border-color: #202023;
+    cursor: not-allowed;
+    user-select: none;
+  }
+
+  .metric-card.disabled .metric-label {
+    color: #52525b;
+  }
+
+  .metric-card.disabled .metric-value {
+    color: #52525b;
+  }
+
+  .metric-card.disabled .indicator {
+    background-color: #3f3f46 !important;
   }
 
   .metric-header {
