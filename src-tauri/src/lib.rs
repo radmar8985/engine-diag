@@ -74,7 +74,7 @@ struct CanReadData {
 
 // ── Shared PCAN state ──
 
-struct CanState(Option<Arc<PcanDriver>>);
+struct CanState(Arc<RwLock<Option<Arc<PcanDriver>>>>);
 
 // ── PostgreSQL configuration & state ──
 
@@ -494,24 +494,47 @@ fn decode_can_frame(
 
 // ── CAN receive stream (CAN tab) ──
 
-fn start_can_stream(app_handle: AppHandle, pcan: Option<Arc<PcanDriver>>) {
-    tauri::async_runtime::spawn(async move {
-        let driver = match pcan {
-            Some(d) => d,
-            None => {
-                eprintln!("[CAN] Brak adaptera PCAN — stream CAN nie zostanie uruchomiony.");
-                return;
+fn get_preferred_pcan_channel() -> Option<u16> {
+    std::env::var("PCAN_CHANNEL").ok().and_then(|v| {
+        if v.starts_with("0x") || v.starts_with("0X") {
+            u16::from_str_radix(&v[2..], 16).ok()
+        } else if let Ok(num) = v.parse::<u16>() {
+            if num < 0x50 {
+                Some(0x50 + num) // e.g. "1" -> 0x51, "2" -> 0x52
+            } else {
+                Some(num)
             }
-        };
+        } else {
+            None
+        }
+    })
+}
 
-        println!("[CAN] Stream CAN uruchomiony — odczyt z PCAN-USB");
+fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<PcanDriver>>>>) {
+    tauri::async_runtime::spawn(async move {
+        println!("[CAN] Pętla obsługi magistrali CAN uruchomiona");
 
         let parser = create_dbc_parser();
         let mut accumulated = CanReadData::default();
 
         loop {
-            // Drain all available frames from the receive buffer
+            let driver_opt = {
+                pcan_holder.read().ok().and_then(|guard| guard.clone())
+            };
+
+            let driver = match driver_opt {
+                Some(d) => d,
+                None => {
+                    let _ = app_handle.emit("can-connection-status", false);
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+            };
+
+            let _ = app_handle.emit("can-connection-status", true);
+
             let mut frames_read = 0u32;
+            let mut read_error = false;
             loop {
                 match driver.read() {
                     Ok(Some(msg)) => {
@@ -524,7 +547,6 @@ fn start_can_stream(app_handle: AppHandle, pcan: Option<Arc<PcanDriver>>) {
                             &msg.data[..len],
                         );
                         frames_read += 1;
-                        // Safety limit to prevent blocking forever if bus is very busy
                         if frames_read >= 500 {
                             break;
                         }
@@ -532,17 +554,19 @@ fn start_can_stream(app_handle: AppHandle, pcan: Option<Arc<PcanDriver>>) {
                     Ok(None) => break, // buffer empty
                     Err(err) => {
                         eprintln!("[CAN] Read error: 0x{:05X}", err);
-                        // Small delay before retry on error
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = app_handle.emit("can-connection-status", false);
+                        read_error = true;
                         break;
                     }
                 }
             }
 
-            // Emit accumulated data to frontend at ~20 Hz
-            let _ = app_handle.emit("can-data-update", accumulated.clone());
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if read_error {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            } else {
+                let _ = app_handle.emit("can-data-update", accumulated.clone());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     });
 }
@@ -575,12 +599,13 @@ fn send_fccu_command(
         if state { "ON" } else { "OFF" }
     );
 
-    if let Some(ref driver) = can_state.0 {
+    let driver_opt = can_state.0.read().ok().and_then(|guard| guard.clone());
+    if let Some(ref driver) = driver_opt {
         driver.write(can_id, &payload).map_err(|e| {
             format!("CAN write error 0x{:05X} for {}", e, name)
         })?;
     } else {
-        println!("[CAN TX] (brak adaptera — ramka nie została wysłana)");
+        return Err("Brak adaptera PCAN-USB — ramka nie została wysłana".to_string());
     }
 
     Ok(format!(
@@ -601,7 +626,6 @@ fn send_fccu_settings(
     d_gain: u16,
     can_state: State<'_, CanState>,
 ) -> Result<String, String> {
-    // 0x520: FCCU_FAN_SETTINGS (8 bajtów: fan_mode=bits 0-1, p_gain=bytes 2-3, i_gain=bytes 4-5, d_gain=bytes 6-7)
     let fan_data: [u8; 8] = [
         (fan_mode & 0x03) as u8,
         0x00,
@@ -613,11 +637,10 @@ fn send_fccu_settings(
         ((d_gain >> 8) & 0xFF) as u8,
     ];
 
-    // 0x521: FCCU_VALVE_SETTINGS (4 bajty: purge_interval_s=bytes 0-1, purge_duration_ms=bytes 2-3)
     let valve_data: [u8; 4] = [
         (purge_interval & 0xFF) as u8,
         ((purge_interval >> 8) & 0xFF) as u8,
-        100u8, // domyślny czas zrzutu 100 ms (zakres FCCU: 10-500 ms)
+        100u8,
         0x00,
     ];
 
@@ -630,7 +653,8 @@ fn send_fccu_settings(
         valve_data, purge_interval
     );
 
-    if let Some(ref driver) = can_state.0 {
+    let driver_opt = can_state.0.read().ok().and_then(|guard| guard.clone());
+    if let Some(ref driver) = driver_opt {
         driver
             .write(0x520, &fan_data)
             .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_FAN_SETTINGS (0x520)", e))?;
@@ -638,7 +662,7 @@ fn send_fccu_settings(
             .write(0x521, &valve_data)
             .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_VALVE_SETTINGS (0x521)", e))?;
     } else {
-        println!("[CAN TX] (brak adaptera — ramki nie zostały wysłane)");
+        return Err("Brak adaptera PCAN-USB — ustawienia nie zostały wysłane".to_string());
     }
 
     Ok(format!(
@@ -671,18 +695,54 @@ fn send_lighting(
         byte0, headlight, position_light, brake_light, left_indicator, right_indicator, hazard
     );
 
-    if let Some(ref driver) = can_state.0 {
+    let driver_opt = can_state.0.read().ok().and_then(|guard| guard.clone());
+    if let Some(ref driver) = driver_opt {
         driver
             .write(0x400, &[byte0])
             .map_err(|e| format!("CAN write error 0x{:05X} for MCU_LIGHTING", e))?;
     } else {
-        println!("[CAN TX] (brak adaptera — ramka nie została wysłana)");
+        return Err("Brak adaptera PCAN-USB — oświetlenie nie zostało wysłane".to_string());
     }
 
     Ok(format!(
         "Wysłano Lighting: H={} P={} B={} L={} R={} Hz={}",
         headlight, position_light, brake_light, left_indicator, right_indicator, hazard
     ))
+}
+
+#[tauri::command]
+fn get_can_status(can_state: State<'_, CanState>) -> bool {
+    can_state
+        .0
+        .read()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+async fn reconnect_pcan(
+    app_handle: AppHandle,
+    can_state: State<'_, CanState>,
+) -> Result<String, String> {
+    let preferred_channel = get_preferred_pcan_channel();
+    match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
+        Ok(driver) => {
+            let ch = driver.channel();
+            let arc_driver = Arc::new(driver);
+            if let Ok(mut guard) = can_state.0.write() {
+                *guard = Some(arc_driver);
+            }
+            let _ = app_handle.emit("can-connection-status", true);
+            Ok(format!("Połączono z adapterem PCAN-USB (kanał 0x{:02X})", ch))
+        }
+        Err(e) => {
+            if let Ok(mut guard) = can_state.0.write() {
+                *guard = None;
+            }
+            let _ = app_handle.emit("can-connection-status", false);
+            Err(format!("Nie wykryto adaptera PCAN-USB: {}", e))
+        }
+    }
 }
 
 #[tauri::command]
@@ -748,6 +808,8 @@ pub fn run() {
             get_db_config,
             get_db_status,
             save_db_config,
+            get_can_status,
+            reconnect_pcan,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -757,21 +819,9 @@ pub fn run() {
             start_pg_stream(app_handle, config_rx, db_status);
 
             // Try to initialize PCAN-USB adapter (auto-detect free channel or read PCAN_CHANNEL env var)
-            let preferred_channel = std::env::var("PCAN_CHANNEL").ok().and_then(|v| {
-                if v.starts_with("0x") || v.starts_with("0X") {
-                    u16::from_str_radix(&v[2..], 16).ok()
-                } else if let Ok(num) = v.parse::<u16>() {
-                    if num < 0x50 {
-                        Some(0x50 + num) // e.g. "1" -> 0x51, "2" -> 0x52
-                    } else {
-                        Some(num)
-                    }
-                } else {
-                    None
-                }
-            });
+            let preferred_channel = get_preferred_pcan_channel();
 
-            let pcan_arc = match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
+            let pcan_initial = match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
                 Ok(driver) => {
                     println!(
                         "[PCAN] Adapter PCAN-USB (kanał 0x{:02X}) gotowy do pracy!",
@@ -786,11 +836,13 @@ pub fn run() {
                 }
             };
 
+            let pcan_holder = Arc::new(RwLock::new(pcan_initial));
+
             // Manage PCAN state for commands
-            app.manage(CanState(pcan_arc.clone()));
+            app.manage(CanState(pcan_holder.clone()));
 
             // Start CAN receive stream
-            start_can_stream(can_handle, pcan_arc);
+            start_can_stream(can_handle, pcan_holder);
 
             Ok(())
         })

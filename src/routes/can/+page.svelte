@@ -5,6 +5,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import Plotly from 'plotly.js-dist-min';
   import { baseLayout, plotlyOptions, MAX_POINTS, fmtVal, calcAvg, calcRms } from '$lib/chartUtils';
+  import { canConnected } from '$lib/stores';
   import type { CanReadData, FccuSettings, LightingState } from '$lib/types';
 
   let canChart1: HTMLElement;
@@ -96,6 +97,21 @@
 
   let isSendingSettings = false;
   let isSendingLighting = false;
+
+  let isReconnectingPcan = false;
+
+  async function handleReconnectPcan() {
+    isReconnectingPcan = true;
+    try {
+      const res = await invoke<string>('reconnect_pcan');
+      showToast(res, false);
+      canConnected.set(true);
+    } catch (err: any) {
+      showToast(typeof err === 'string' ? err : (err?.message || 'Nie wykryto adaptera PCAN-USB'), true);
+    } finally {
+      isReconnectingPcan = false;
+    }
+  }
 
   let fccuSettings: FccuSettings = {
     fanMode: 0,
@@ -217,6 +233,16 @@
   }
 
   onMount(() => {
+    invoke<boolean>('get_can_status')
+      .then((connected) => {
+        canConnected.set(connected);
+      })
+      .catch(() => {});
+
+    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => {
+      canConnected.set(event.payload);
+    });
+
     if (canChart1 && canChart2) {
       Plotly.newPlot(canChart1, canChartConfigs.chart1.data, canChartConfigs.chart1.layout, plotlyOptions);
       Plotly.newPlot(canChart2, canChartConfigs.chart2.data, canChartConfigs.chart2.layout, plotlyOptions);
@@ -228,6 +254,7 @@
       const now = new Date().toLocaleTimeString();
 
       hasCanData = true;
+      canConnected.set(true);
 
       if (d.fccu_state !== undefined) {
         fccuState = d.fccu_state;
@@ -294,6 +321,7 @@
 
     return () => {
       unlistenCan.then((u) => u());
+      unlistenCanStatus.then((u) => u());
       (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
         if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
       });
@@ -301,7 +329,29 @@
   });
 </script>
 
-<div class="can-view-wrapper">
+<div class="can-view-wrapper" class:disabled={!$canConnected}>
+  {#if !$canConnected}
+    <div class="can-disconnected-banner">
+      <div class="can-disconnected-content">
+        <span class="can-disconnected-icon">🔌</span>
+        <div class="can-disconnected-text">
+          <div class="can-disconnected-title">Brak połączenia z adapterem PCAN-USB (magistrala CAN)</div>
+          <div class="can-disconnected-desc">
+            Zakładka CAN jest nieaktywna. Podłącz adapter USB do komputera i upewnij się, że sterowniki są zainstalowane.
+          </div>
+        </div>
+        <button
+          type="button"
+          class="btn-reconnect-pcan"
+          disabled={isReconnectingPcan}
+          on:click={handleReconnectPcan}
+        >
+          {isReconnectingPcan ? 'Wyszukiwanie adaptera...' : 'Ponów próbę połączenia USB'}
+        </button>
+      </div>
+    </div>
+  {/if}
+
   <div class="top-status-bar">
     <div class="top-status-item">
       <span class="status-lbl">Stan systemu</span>
@@ -679,6 +729,77 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    position: relative;
+    transition: opacity 0.3s ease, filter 0.3s ease;
+  }
+
+  .can-view-wrapper.disabled > *:not(.can-disconnected-banner):not(.toast-container) {
+    opacity: 0.32;
+    filter: grayscale(0.85);
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .can-disconnected-banner {
+    pointer-events: auto;
+    background: rgba(24, 24, 27, 0.95);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    border-radius: 10px;
+    padding: 14px 20px;
+    backdrop-filter: blur(6px);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  }
+
+  .can-disconnected-content {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .can-disconnected-icon {
+    font-size: 1.5rem;
+  }
+
+  .can-disconnected-text {
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .can-disconnected-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #f87171;
+  }
+
+  .can-disconnected-desc {
+    font-size: 0.8rem;
+    color: #a1a1aa;
+    margin-top: 3px;
+  }
+
+  .btn-reconnect-pcan {
+    background: linear-gradient(135deg, #2563eb, #1d4ed8);
+    border: 1px solid #3b82f6;
+    color: #ffffff;
+    font-weight: 600;
+    font-size: 0.82rem;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .btn-reconnect-pcan:hover:not(:disabled) {
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.4);
+  }
+
+  .btn-reconnect-pcan:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .top-status-bar {

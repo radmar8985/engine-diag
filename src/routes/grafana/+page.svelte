@@ -250,11 +250,27 @@
   {/if}
 </div>
 
-<div class="chart-container"><h3 class="chart-title">Napięcia (U_FC, U_SC, U_MC)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={voltChart}></div></div></div>
-<div class="chart-container"><h3 class="chart-title">Prądy (I_FC, I_SC, I_MC)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={currChart}></div></div></div>
-<div class="chart-container"><h3 class="chart-title">Temperatura</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={tempChart}></div></div></div>
-<div class="chart-container"><h3 class="chart-title">Prędkość obrotowa (RPM)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={rpmChart}></div></div></div>
-<div class="chart-container"><h3 class="chart-title">Moc (P_FC, P_SC, P_MC)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={powerChart}></div></div></div>
+<div class="charts-area-wrapper" class:disabled={!$dbStatus.connected}>
+  {#if !$dbStatus.connected}
+    <div class="db-disabled-banner">
+      <div class="db-disabled-content">
+        <span class="db-disabled-icon">⚠️</span>
+        <div class="db-disabled-text">
+          <div class="db-disabled-title">Brak aktywnego połączenia z bazą danych (PostgreSQL)</div>
+          <div class="db-disabled-desc">
+            Wykresy telemetryczne są nieaktywne. Wprowadź parametry bazy w panelu powyżej i kliknij „Zastosuj i połącz z bazą”.
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <div class="chart-container"><h3 class="chart-title">Napięcia (U_FC, U_SC, U_MC)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={voltChart}></div></div></div>
+  <div class="chart-container"><h3 class="chart-title">Prądy (I_FC, I_SC, I_MC)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={currChart}></div></div></div>
+  <div class="chart-container"><h3 class="chart-title">Temperatura</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={tempChart}></div></div></div>
+  <div class="chart-container"><h3 class="chart-title">Prędkość obrotowa (RPM)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={rpmChart}></div></div></div>
+  <div class="chart-container"><h3 class="chart-title">Moc (P_FC, P_SC, P_MC)</h3><div class="canvas-wrapper"><div class="plotly-chart" bind:this={powerChart}></div></div></div>
+</div>
 
 <style>
   .db-config-card {
@@ -442,8 +458,59 @@
     border: 1px solid #27272a;
     border-radius: 12px;
     padding: 16px 20px;
+    transition: opacity 0.3s ease, filter 0.3s ease;
   }
   .chart-title { font-size: 0.9rem; color: #a1a1aa; margin: 0 0 10px 0; }
   .canvas-wrapper { height: 220px; width: 100%; }
   .plotly-chart { width: 100%; height: 100%; }
+
+  .charts-area-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    position: relative;
+    transition: opacity 0.3s ease, filter 0.3s ease;
+  }
+
+  .charts-area-wrapper.disabled {
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .charts-area-wrapper.disabled .chart-container {
+    opacity: 0.32;
+    filter: grayscale(0.85);
+  }
+
+  .db-disabled-banner {
+    pointer-events: auto;
+    background: rgba(24, 24, 27, 0.95);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    border-radius: 10px;
+    padding: 14px 20px;
+    backdrop-filter: blur(6px);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  }
+
+  .db-disabled-content {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .db-disabled-icon {
+    font-size: 1.5rem;
+  }
+
+  .db-disabled-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #f87171;
+  }
+
+  .db-disabled-desc {
+    font-size: 0.8rem;
+    color: #a1a1aa;
+    margin-top: 3px;
+  }
 </style>

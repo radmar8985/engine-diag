@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { listen } from '@tauri-apps/api/event';
+  import { invoke } from '@tauri-apps/api/core';
   import { currentReadings, canConnected, lastCanFrameTime, dbStatus } from '$lib/stores';
   import { fmtVal, getStatus } from '$lib/chartUtils';
   import type { EngineData, CanReadData, DbStatus } from '$lib/types';
@@ -9,6 +10,9 @@
   let { children } = $props();
 
   let isCanTab = $derived($page.url.pathname === '/can');
+  let isCurrentSourceConnected = $derived(
+    isCanTab ? $canConnected : $dbStatus.connected
+  );
 
   const thresholds = {
     voltage: { min: 40, max: 52 },
@@ -19,6 +23,22 @@
   };
 
   onMount(() => {
+    invoke<boolean>('get_can_status')
+      .then((connected) => {
+        canConnected.set(connected);
+      })
+      .catch(() => {});
+
+    invoke<DbStatus>('get_db_status')
+      .then((status) => {
+        if (status) dbStatus.set(status);
+      })
+      .catch(() => {});
+
+    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => {
+      canConnected.set(event.payload);
+    });
+
     const unlistenPg = listen<EngineData>('engine-data-update', (event) => {
       if ($page.url.pathname !== '/can') {
         currentReadings.set(event.payload);
@@ -55,6 +75,7 @@
       unlistenPg.then((u) => u());
       unlistenCan.then((u) => u());
       unlistenDb.then((u) => u());
+      unlistenCanStatus.then((u) => u());
     };
   });
 </script>
@@ -86,78 +107,93 @@
 
       <!-- Napięcia -->
       <div class="metric-group">
-        <div class="metric-card status-{getStatus($currentReadings.voltage1, thresholds.voltage)}">
+        <div
+          class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.voltage1, thresholds.voltage)}"
+          class:disabled={!isCurrentSourceConnected}
+        >
           <div class="metric-header"><span class="metric-label">U_FC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.voltage1, 1)} <span class="unit">V</span></div>
+          <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.voltage1, 1)} <span class="unit">V</span></div>
         </div>
         <div
-          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.voltage2, thresholds.voltage)}"
-          class:disabled={isCanTab}
+          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.voltage2, thresholds.voltage)}"
+          class:disabled={isCanTab || !isCurrentSourceConnected}
         >
           <div class="metric-header"><span class="metric-label">U_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.voltage2, 1)} <span class="unit">V</span></div>
+          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.voltage2, 1)} <span class="unit">V</span></div>
         </div>
         <div
-          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.voltage3, thresholds.voltage)}"
-          class:disabled={isCanTab}
+          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.voltage3, thresholds.voltage)}"
+          class:disabled={isCanTab || !isCurrentSourceConnected}
         >
           <div class="metric-header"><span class="metric-label">U_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.voltage3, 1)} <span class="unit">V</span></div>
+          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.voltage3, 1)} <span class="unit">V</span></div>
         </div>
       </div>
 
       <!-- Prądy -->
       <div class="metric-group">
-        <div class="metric-card status-{getStatus($currentReadings.current1, thresholds.current)}">
+        <div
+          class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.current1, thresholds.current)}"
+          class:disabled={!isCurrentSourceConnected}
+        >
           <div class="metric-header"><span class="metric-label">I_FC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.current1, 1)} <span class="unit">A</span></div>
+          <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.current1, 1)} <span class="unit">A</span></div>
         </div>
         <div
-          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.current2, thresholds.current)}"
-          class:disabled={isCanTab}
+          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.current2, thresholds.current)}"
+          class:disabled={isCanTab || !isCurrentSourceConnected}
         >
           <div class="metric-header"><span class="metric-label">I_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.current2, 1)} <span class="unit">A</span></div>
+          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.current2, 1)} <span class="unit">A</span></div>
         </div>
         <div
-          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.current3, thresholds.current)}"
-          class:disabled={isCanTab}
+          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.current3, thresholds.current)}"
+          class:disabled={isCanTab || !isCurrentSourceConnected}
         >
           <div class="metric-header"><span class="metric-label">I_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.current3, 1)} <span class="unit">A</span></div>
+          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.current3, 1)} <span class="unit">A</span></div>
         </div>
       </div>
 
       <!-- Moce -->
       <div class="metric-group">
-        <div class="metric-card status-{getStatus($currentReadings.power1, thresholds.power)}">
+        <div
+          class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.power1, thresholds.power)}"
+          class:disabled={!isCurrentSourceConnected}
+        >
           <div class="metric-header"><span class="metric-label">P_FC</span><div class="indicator"></div></div>
-          <div class="metric-value">{fmtVal($currentReadings.power1, 0)} <span class="unit">W</span></div>
+          <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.power1, 0)} <span class="unit">W</span></div>
         </div>
         <div
-          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.power2, thresholds.power)}"
-          class:disabled={isCanTab}
+          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.power2, thresholds.power)}"
+          class:disabled={isCanTab || !isCurrentSourceConnected}
         >
           <div class="metric-header"><span class="metric-label">P_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.power2, 0)} <span class="unit">W</span></div>
+          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.power2, 0)} <span class="unit">W</span></div>
         </div>
         <div
-          class="metric-card status-{isCanTab ? 'disabled' : getStatus($currentReadings.power3, thresholds.power)}"
-          class:disabled={isCanTab}
+          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.power3, thresholds.power)}"
+          class:disabled={isCanTab || !isCurrentSourceConnected}
         >
           <div class="metric-header"><span class="metric-label">P_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab ? '—' : fmtVal($currentReadings.power3, 0)} <span class="unit">W</span></div>
+          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.power3, 0)} <span class="unit">W</span></div>
         </div>
       </div>
 
-      <div class="metric-card status-{getStatus($currentReadings.temperature, thresholds.temperature)}">
+      <div
+        class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.temperature, thresholds.temperature)}"
+        class:disabled={!isCurrentSourceConnected}
+      >
         <div class="metric-header"><span class="metric-label">Temperatura</span><div class="indicator"></div></div>
-        <div class="metric-value">{fmtVal($currentReadings.temperature, 1)} <span class="unit">°C</span></div>
+        <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.temperature, 1)} <span class="unit">°C</span></div>
       </div>
 
-      <div class="metric-card status-{getStatus($currentReadings.rpm, thresholds.rpm)}">
+      <div
+        class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.rpm, thresholds.rpm)}"
+        class:disabled={!isCurrentSourceConnected}
+      >
         <div class="metric-header"><span class="metric-label">Prędkość obrotowa</span><div class="indicator"></div></div>
-        <div class="metric-value">{fmtVal($currentReadings.rpm, 0)} <span class="unit">obr./min</span></div>
+        <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.rpm, 0)} <span class="unit">obr./min</span></div>
       </div>
     </div>
 
@@ -167,11 +203,13 @@
         {#if isCanTab}
           <div class="can-comm-row">
             <span class="can-comm-label">Połączenie</span>
-            <span class="can-comm-value">{$canConnected ? 'Połączono' : 'Brak informacji'}</span>
+            <span class="can-comm-value {$canConnected ? 'status-text-ok' : 'status-text-err'}">
+              {$canConnected ? 'Połączono' : 'Rozłączono'}
+            </span>
           </div>
           <div class="can-comm-row">
             <span class="can-comm-label">Ostatnia ramka</span>
-            <span class="can-comm-value">{$lastCanFrameTime}</span>
+            <span class="can-comm-value">{$canConnected ? $lastCanFrameTime : '—'}</span>
           </div>
         {:else}
           <div class="can-comm-row">
