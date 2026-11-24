@@ -232,15 +232,41 @@
     }
   }
 
+  function resetCanData() {
+    hasCanData = false;
+    fccuState = 0;
+    fccuMainValve = false;
+    fccuPurgeValve = false;
+    fccuFanState = false;
+    fccuFanDuty = 0;
+    fccuVersion = '—';
+    (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
+      if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
+    });
+    pendingCmds = {
+      system_enable: false,
+      main_valve: false,
+      manual_purge: false,
+      fan_on: false
+    };
+    expectedStates = {};
+  }
+
   onMount(() => {
     invoke<boolean>('get_can_status')
       .then((connected) => {
         canConnected.set(connected);
+        if (!connected) {
+          resetCanData();
+        }
       })
       .catch(() => {});
 
     const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => {
       canConnected.set(event.payload);
+      if (!event.payload) {
+        resetCanData();
+      }
     });
 
     if (canChart1 && canChart2) {
@@ -250,11 +276,11 @@
     }
 
     const unlistenCan = listen<CanReadData>('can-data-update', (event) => {
+      if (!$canConnected) return;
       const d = event.payload;
       const now = new Date().toLocaleTimeString();
 
       hasCanData = true;
-      canConnected.set(true);
 
       if (d.fccu_state !== undefined) {
         fccuState = d.fccu_state;
@@ -337,17 +363,23 @@
         <div class="can-disconnected-text">
           <div class="can-disconnected-title">Brak połączenia z adapterem PCAN-USB (magistrala CAN)</div>
           <div class="can-disconnected-desc">
-            Zakładka CAN jest nieaktywna. Podłącz adapter USB do komputera i upewnij się, że sterowniki są zainstalowane.
+            Zakładka CAN jest zablokowana. Trwa automatyczne nasłuchiwanie USB w tle — po podłączeniu adaptera połączenie zostanie wznowione samoczynnie.
           </div>
         </div>
-        <button
-          type="button"
-          class="btn-reconnect-pcan"
-          disabled={isReconnectingPcan}
-          on:click={handleReconnectPcan}
-        >
-          {isReconnectingPcan ? 'Wyszukiwanie adaptera...' : 'Ponów próbę połączenia USB'}
-        </button>
+        <div class="can-disconnected-actions">
+          <div class="auto-listening-pill">
+            <span class="pulsing-circle"></span>
+            <span>Nasłuchiwanie USB w toku...</span>
+          </div>
+          <button
+            type="button"
+            class="btn-reconnect-pcan"
+            disabled={isReconnectingPcan}
+            on:click={handleReconnectPcan}
+          >
+            {isReconnectingPcan ? 'Wykrywanie...' : 'Wymuś wykrycie'}
+          </button>
+        </div>
       </div>
     </div>
   {/if}
@@ -800,6 +832,50 @@
   .btn-reconnect-pcan:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  .can-disconnected-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .auto-listening-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(39, 39, 42, 0.85);
+    border: 1px solid #3f3f46;
+    padding: 6px 12px;
+    border-radius: 9999px;
+    font-size: 0.78rem;
+    color: #cbd5e1;
+    white-space: nowrap;
+  }
+
+  .pulsing-circle {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: #38bdf8;
+    box-shadow: 0 0 0 rgba(56, 189, 248, 0.5);
+    animation: pulse-glow 1.5s infinite;
+  }
+
+  @keyframes pulse-glow {
+    0% {
+      transform: scale(0.95);
+      box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.7);
+    }
+    70% {
+      transform: scale(1);
+      box-shadow: 0 0 0 6px rgba(56, 189, 248, 0);
+    }
+    100% {
+      transform: scale(0.95);
+      box-shadow: 0 0 0 0 rgba(56, 189, 248, 0);
+    }
   }
 
   .top-status-bar {

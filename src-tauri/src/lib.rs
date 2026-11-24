@@ -512,10 +512,11 @@ fn get_preferred_pcan_channel() -> Option<u16> {
 
 fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<PcanDriver>>>>) {
     tauri::async_runtime::spawn(async move {
-        println!("[CAN] Pętla obsługi magistrali CAN uruchomiona");
+        println!("[CAN] Pętla obsługi magistrali CAN uruchomiona (ciągłe nasłuchiwanie / auto-reconnect)");
 
         let parser = create_dbc_parser();
         let mut accumulated = CanReadData::default();
+        let mut was_connected = false;
 
         loop {
             let driver_opt = {
@@ -523,18 +524,59 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
             };
 
             let driver = match driver_opt {
-                Some(d) => d,
+                Some(d) => {
+                    if !d.is_hardware_ok() {
+                        eprintln!("[CAN] Wykryto fizyczne odłączenie adaptera PCAN-USB (sprawdzenie sprzętowe)");
+                        if let Ok(mut guard) = pcan_holder.write() {
+                            *guard = None;
+                        }
+                        if was_connected {
+                            let _ = app_handle.emit("can-connection-status", false);
+                            was_connected = false;
+                        }
+                        accumulated = CanReadData::default();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    d
+                }
                 None => {
-                    let _ = app_handle.emit("can-connection-status", false);
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                    continue;
+                    // Brak adaptera — ciągłe nasłuchiwanie USB w tle (auto-reconnect)
+                    let preferred_channel = get_preferred_pcan_channel();
+                    match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
+                        Ok(new_driver) => {
+                            let ch = new_driver.channel();
+                            println!(
+                                "[CAN] Automatycznie wykryto i połączono adapter PCAN-USB (kanał 0x{:02X})!",
+                                ch
+                            );
+                            let arc_driver = Arc::new(new_driver);
+                            if let Ok(mut guard) = pcan_holder.write() {
+                                *guard = Some(arc_driver.clone());
+                            }
+                            let _ = app_handle.emit("can-connection-status", true);
+                            was_connected = true;
+                            arc_driver
+                        }
+                        Err(_) => {
+                            if was_connected {
+                                let _ = app_handle.emit("can-connection-status", false);
+                                was_connected = false;
+                            }
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    }
                 }
             };
 
-            let _ = app_handle.emit("can-connection-status", true);
+            if !was_connected {
+                let _ = app_handle.emit("can-connection-status", true);
+                was_connected = true;
+            }
 
             let mut frames_read = 0u32;
-            let mut read_error = false;
+            let mut hardware_lost = false;
             loop {
                 match driver.read() {
                     Ok(Some(msg)) => {
@@ -553,15 +595,26 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
                     }
                     Ok(None) => break, // buffer empty
                     Err(err) => {
-                        eprintln!("[CAN] Read error: 0x{:05X}", err);
-                        let _ = app_handle.emit("can-connection-status", false);
-                        read_error = true;
+                        const FATAL_MASK: u32 =
+                            0x04000000 | 0x00001400 | 0x00000200 | 0x00000100 | 0x00001800 | 0x00001C00;
+                        if (err & FATAL_MASK) != 0 || !driver.is_hardware_ok() {
+                            eprintln!("[CAN] Błąd odczytu 0x{:05X} — adapter odłączony!", err);
+                            hardware_lost = true;
+                        } else {
+                            eprintln!("[CAN] Ostrzeżenie magistrali CAN: 0x{:05X}", err);
+                        }
                         break;
                     }
                 }
             }
 
-            if read_error {
+            if hardware_lost {
+                if let Ok(mut guard) = pcan_holder.write() {
+                    *guard = None;
+                }
+                let _ = app_handle.emit("can-connection-status", false);
+                was_connected = false;
+                accumulated = CanReadData::default();
                 tokio::time::sleep(Duration::from_millis(500)).await;
             } else {
                 let _ = app_handle.emit("can-data-update", accumulated.clone());
@@ -715,7 +768,12 @@ fn get_can_status(can_state: State<'_, CanState>) -> bool {
     can_state
         .0
         .read()
-        .map(|guard| guard.is_some())
+        .map(|guard| {
+            guard
+                .as_ref()
+                .map(|driver| driver.is_hardware_ok())
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 

@@ -65,6 +65,7 @@ pub struct TPCANTimestamp {
 
 type FnInitialize = unsafe extern "system" fn(u16, u16, u8, u32, u32) -> u32;
 type FnUninitialize = unsafe extern "system" fn(u16) -> u32;
+type FnGetStatus = unsafe extern "system" fn(u16) -> u32;
 type FnRead = unsafe extern "system" fn(u16, *mut TPCANMsg, *mut TPCANTimestamp) -> u32;
 type FnWrite = unsafe extern "system" fn(u16, *mut TPCANMsg) -> u32;
 
@@ -76,6 +77,7 @@ pub struct PcanDriver {
     fn_read: FnRead,
     fn_write: FnWrite,
     fn_uninit: FnUninitialize,
+    fn_get_status: FnGetStatus,
 }
 
 // Safety: Library is kept alive solely to prevent unloading — it is never
@@ -113,6 +115,7 @@ impl PcanDriver {
 
         let fn_init: FnInitialize;
         let fn_uninit: FnUninitialize;
+        let fn_get_status: FnGetStatus;
         let fn_read: FnRead;
         let fn_write: FnWrite;
 
@@ -128,6 +131,12 @@ impl PcanDriver {
                 .map_err(|e| PcanError {
                     code: 0xFFFFFFFF,
                     message: format!("Symbol CAN_Uninitialize not found: {}", e),
+                })?;
+            fn_get_status = **lib
+                .get::<Symbol<FnGetStatus>>(b"CAN_GetStatus\0")
+                .map_err(|e| PcanError {
+                    code: 0xFFFFFFFF,
+                    message: format!("Symbol CAN_GetStatus not found: {}", e),
                 })?;
             fn_read = **lib
                 .get::<Symbol<FnRead>>(b"CAN_Read\0")
@@ -170,6 +179,7 @@ impl PcanDriver {
                     fn_read,
                     fn_write,
                     fn_uninit,
+                    fn_get_status,
                 });
             } else {
                 last_err = status;
@@ -190,6 +200,26 @@ impl PcanDriver {
         self.channel
     }
 
+    /// Query current channel status directly from the PCAN driver.
+    pub fn get_status(&self) -> u32 {
+        unsafe { (self.fn_get_status)(self.channel) }
+    }
+
+    /// Check whether hardware is still connected and channel is valid.
+    pub fn is_hardware_ok(&self) -> bool {
+        let status = self.get_status();
+        // Fatal hardware disconnect / uninitialized / driver missing errors:
+        // 0x04000000 = PCAN_ERROR_INITIALIZE
+        // 0x00001400 = PCAN_ERROR_ILLHW
+        // 0x00000200 = PCAN_ERROR_NODRIVER
+        // 0x00000100 = PCAN_ERROR_REGTEST
+        // 0x00001800 = PCAN_ERROR_ILLNET
+        // 0x00001C00 = PCAN_ERROR_ILLCLIENT
+        const FATAL_MASK: u32 =
+            0x04000000 | 0x00001400 | 0x00000200 | 0x00000100 | 0x00001800 | 0x00001C00;
+        (status & FATAL_MASK) == 0
+    }
+
     /// Read a single CAN message from the receive buffer.
     /// Returns Ok(Some(msg)) if a message was available, Ok(None) if buffer empty.
     pub fn read(&self) -> Result<Option<TPCANMsg>, u32> {
@@ -197,10 +227,12 @@ impl PcanDriver {
         let mut ts = TPCANTimestamp::default();
 
         let status = unsafe { (self.fn_read)(self.channel, &mut msg, &mut ts) };
-        match status {
-            PCAN_ERROR_OK => Ok(Some(msg)),
-            PCAN_ERROR_QRCVEMPTY => Ok(None),
-            err => Err(err),
+        if status == PCAN_ERROR_OK {
+            Ok(Some(msg))
+        } else if (status & PCAN_ERROR_QRCVEMPTY) != 0 {
+            Ok(None)
+        } else {
+            Err(status)
         }
     }
 

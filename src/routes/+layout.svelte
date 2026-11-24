@@ -22,10 +22,32 @@
     power: { min: 0, max: 1000 }
   };
 
+  function resetCanReadings() {
+    lastCanFrameTime.set('—');
+    if ($page.url.pathname === '/can') {
+      currentReadings.set({
+        voltage1: 0,
+        voltage2: 0,
+        voltage3: 0,
+        current1: 0,
+        current2: 0,
+        current3: 0,
+        power1: 0,
+        power2: 0,
+        power3: 0,
+        temperature: 0,
+        rpm: 0
+      });
+    }
+  }
+
   onMount(() => {
     invoke<boolean>('get_can_status')
       .then((connected) => {
         canConnected.set(connected);
+        if (!connected) {
+          resetCanReadings();
+        }
       })
       .catch(() => {});
 
@@ -37,6 +59,9 @@
 
     const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => {
       canConnected.set(event.payload);
+      if (!event.payload) {
+        resetCanReadings();
+      }
     });
 
     const unlistenPg = listen<EngineData>('engine-data-update', (event) => {
@@ -46,8 +71,8 @@
     });
 
     const unlistenCan = listen<CanReadData>('can-data-update', (event) => {
+      if (!$canConnected) return;
       const d = event.payload;
-      canConnected.set(true);
       lastCanFrameTime.set(new Date().toLocaleTimeString());
 
       if ($page.url.pathname === '/can') {
