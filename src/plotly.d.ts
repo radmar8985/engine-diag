@@ -50,7 +50,7 @@ declare module 'plotly.js-dist-min' {
     tickfont?: FontConfig;
     tickmode?: 'auto' | 'linear' | 'array';
     dtick?: number | string;
-    range?: [number, number];
+    range?: [string | number | Date, string | number | Date];
     autorange?: boolean | 'reversed';
     showgrid?: boolean;
     [key: string]: unknown;
@@ -126,6 +126,13 @@ declare module 'plotly.js-dist-min' {
     layout: Partial<PlotLayout>
   ): Promise<HTMLElement>;
 
+  export function update(
+    root: Root,
+    traceUpdate: PlotlyExtendData,
+    layoutUpdate: Partial<PlotLayout>,
+    traceIndices?: number | number[]
+  ): Promise<HTMLElement>;
+
   export function restyle(
     root: Root,
     aobj: Record<string, unknown>,
@@ -138,6 +145,7 @@ declare module 'plotly.js-dist-min' {
     newPlot: typeof newPlot;
     extendTraces: typeof extendTraces;
     relayout: typeof relayout;
+    update: typeof update;
     restyle: typeof restyle;
     purge: typeof purge;
   }

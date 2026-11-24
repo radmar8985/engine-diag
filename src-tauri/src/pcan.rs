@@ -31,6 +31,15 @@ pub const PCAN_MESSAGE_EXTENDED: u8 = 0x02;
 pub const PCAN_ERROR_OK: u32 = 0x00000;
 pub const PCAN_ERROR_QRCVEMPTY: u32 = 0x00020;
 
+/// Fatal hardware disconnect / uninitialized / driver missing bitmask.
+pub const PCAN_FATAL_ERROR_MASK: u32 =
+    0x04000000 | 0x00001400 | 0x00000200 | 0x00000100 | 0x00001800 | 0x00001C00;
+
+/// Returns true if the given PCAN status code indicates the hardware handle is still valid.
+pub fn is_status_hardware_ok(status: u32) -> bool {
+    (status & PCAN_FATAL_ERROR_MASK) == 0
+}
+
 // ── PCAN Structures (C ABI) ──
 
 #[repr(C)]
@@ -207,17 +216,7 @@ impl PcanDriver {
 
     /// Check whether hardware is still connected and channel is valid.
     pub fn is_hardware_ok(&self) -> bool {
-        let status = self.get_status();
-        // Fatal hardware disconnect / uninitialized / driver missing errors:
-        // 0x04000000 = PCAN_ERROR_INITIALIZE
-        // 0x00001400 = PCAN_ERROR_ILLHW
-        // 0x00000200 = PCAN_ERROR_NODRIVER
-        // 0x00000100 = PCAN_ERROR_REGTEST
-        // 0x00001800 = PCAN_ERROR_ILLNET
-        // 0x00001C00 = PCAN_ERROR_ILLCLIENT
-        const FATAL_MASK: u32 =
-            0x04000000 | 0x00001400 | 0x00000200 | 0x00000100 | 0x00001800 | 0x00001C00;
-        (status & FATAL_MASK) == 0
+        is_status_hardware_ok(self.get_status())
     }
 
     /// Read a single CAN message from the receive buffer.
@@ -267,5 +266,45 @@ impl Drop for PcanDriver {
                 status, self.channel
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_status_hardware_ok_for_valid_and_bus_warning_codes() {
+        assert!(is_status_hardware_ok(PCAN_ERROR_OK));
+        assert!(is_status_hardware_ok(PCAN_ERROR_QRCVEMPTY));
+        assert!(is_status_hardware_ok(0x00004)); // PCAN_ERROR_BUSLIGHT
+        assert!(is_status_hardware_ok(0x00008)); // PCAN_ERROR_BUSHEAVY
+        assert!(is_status_hardware_ok(0x00010)); // PCAN_ERROR_BUSOFF
+        assert!(is_status_hardware_ok(0x40000)); // PCAN_ERROR_BUSPASSIVE
+    }
+
+    #[test]
+    fn test_is_status_hardware_ok_detects_disconnect_and_init_errors() {
+        assert!(!is_status_hardware_ok(0x04000000)); // PCAN_ERROR_INITIALIZE
+        assert!(!is_status_hardware_ok(0x00001400)); // PCAN_ERROR_ILLHW
+        assert!(!is_status_hardware_ok(0x00000200)); // PCAN_ERROR_NODRIVER
+        assert!(!is_status_hardware_ok(0x00000100)); // PCAN_ERROR_REGTEST
+        assert!(!is_status_hardware_ok(0x00001800)); // PCAN_ERROR_ILLNET
+        assert!(!is_status_hardware_ok(0x00001C00)); // PCAN_ERROR_ILLCLIENT
+        assert!(!is_status_hardware_ok(0x04000020)); // INITIALIZE | QRCVEMPTY
+    }
+
+    #[test]
+    fn test_pcan_error_display_and_msg_default() {
+        let err = PcanError {
+            code: 0x01400,
+            message: "Invalid hardware".to_string(),
+        };
+        assert_eq!(format!("{}", err), "PCAN error 0x01400: Invalid hardware");
+
+        let msg = TPCANMsg::default();
+        assert_eq!(msg.id, 0);
+        assert_eq!(msg.len, 0);
+        assert_eq!(msg.data, [0u8; 8]);
     }
 }

@@ -1,80 +1,80 @@
-mod pcan;
+pub mod pcan;
 
-use pcan::{PcanDriver, PCAN_BAUD_500K};
+use pcan::{is_status_hardware_ok, PcanDriver, PCAN_BAUD_500K};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio_postgres::NoTls;
 
 // ── Data models ──
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-struct EngineData {
-    voltage1: f64,
-    voltage2: f64,
-    voltage3: f64,
-    current1: f64,
-    current2: f64,
-    current3: f64,
-    power1: f64,
-    power2: f64,
-    power3: f64,
-    temperature: f64,
-    rpm: f64,
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct EngineData {
+    pub voltage1: f64,
+    pub voltage2: f64,
+    pub voltage3: f64,
+    pub current1: f64,
+    pub current2: f64,
+    pub current3: f64,
+    pub power1: f64,
+    pub power2: f64,
+    pub power3: f64,
+    pub temperature: f64,
+    pub rpm: f64,
 }
 
 /// CAN data received from the bus — maps to DBC signals
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-struct CanReadData {
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct CanReadData {
     // MCU_ANALOG_FUEL_CELL (0x104)
-    fc_output_voltage: f64,
-    fc_output_current: f64,
-    h2_high_pressure: f64,
+    pub fc_output_voltage: f64,
+    pub fc_output_current: f64,
+    pub h2_high_pressure: f64,
     // MCU_ANALOG_POWERTRAIN (0x105)
-    sc_voltage: f64,
-    sc_current: f64,
-    mc_supply_voltage: f64,
-    mc_supply_current: f64,
+    pub sc_voltage: f64,
+    pub sc_current: f64,
+    pub mc_supply_voltage: f64,
+    pub mc_supply_current: f64,
     // MCU_ANALOG_ACCESSORY (0x106)
-    ab_voltage: f64,
-    ab_current: f64,
+    pub ab_voltage: f64,
+    pub ab_current: f64,
     // MCU_ANALOG_DRIVE (0x107)
-    rpm: f64,
-    speed: f64,
+    pub rpm: f64,
+    pub speed: f64,
     // FCCU_POWER (0x503)
-    fccu_fc_voltage: f64,
-    fccu_fc_current: f64,
-    fccu_dcdc_voltage: f64,
-    fccu_dcdc_current: f64,
+    pub fccu_fc_voltage: f64,
+    pub fccu_fc_current: f64,
+    pub fccu_dcdc_voltage: f64,
+    pub fccu_dcdc_current: f64,
     // FCCU_ENVIRONMENT (0x504)
-    fc_temp: f64,
-    ambient_temp: f64,
-    ambient_humidity: f64,
+    pub fc_temp: f64,
+    pub ambient_temp: f64,
+    pub ambient_humidity: f64,
     // FCCU_STATE (0x500)
-    fccu_state: u8,
-    fccu_main_valve: bool,
-    fccu_purge_valve: bool,
-    fccu_fan_state: bool,
-    fccu_fan_duty: u8,
+    pub fccu_state: u8,
+    pub fccu_main_valve: bool,
+    pub fccu_purge_valve: bool,
+    pub fccu_fan_state: bool,
+    pub fccu_fan_duty: u8,
     // FCCU_VERSION (0x501)
-    fccu_version: String,
+    pub fccu_version: String,
     // FCCU_HYDROGEN (0x502)
-    h2_flow: f64,
-    h2_lp_pressure: f64,
+    pub h2_flow: f64,
+    pub h2_lp_pressure: f64,
     // PROTIUM_POWER (0x200)
-    fc_w: f64,
-    energy_wh: f64,
+    pub fc_w: f64,
+    pub energy_wh: f64,
     // MCU_STATE (0x100)
-    mcu_status: u8,
-    vehicle_type: u8,
-    motor_controller_enabled: bool,
-    main_valve_enabled: bool,
+    pub mcu_status: u8,
+    pub vehicle_type: u8,
+    pub motor_controller_enabled: bool,
+    pub main_valve_enabled: bool,
 }
 
 // ── Shared PCAN state ──
 
-struct CanState(Arc<RwLock<Option<Arc<PcanDriver>>>>);
+pub struct CanState(pub Arc<RwLock<Option<Arc<PcanDriver>>>>);
 
 // ── PostgreSQL configuration & state ──
 
@@ -99,7 +99,7 @@ impl Default for DbConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DbStatus {
     pub connected: bool,
     pub message: String,
@@ -108,6 +108,27 @@ pub struct DbStatus {
 pub struct DbConfigState {
     pub tx: tokio::sync::watch::Sender<DbConfig>,
     pub status: Arc<RwLock<DbStatus>>,
+}
+
+pub fn load_db_config_from_path(path: &std::path::Path) -> DbConfig {
+    let mut cfg = DbConfig::default();
+    if let Ok(iter) = dotenvy::from_path_iter(path) {
+        for item in iter.flatten() {
+            match item.0.as_str() {
+                "PG_HOST" => cfg.host = item.1,
+                "PG_PORT" => {
+                    if let Ok(p) = item.1.parse::<u16>() {
+                        cfg.port = p;
+                    }
+                }
+                "PG_USER" => cfg.user = item.1,
+                "PG_PASSWORD" => cfg.password = item.1,
+                "PG_DBNAME" => cfg.dbname = item.1,
+                _ => {}
+            }
+        }
+    }
+    cfg
 }
 
 fn load_initial_db_config() -> DbConfig {
@@ -124,6 +145,14 @@ fn load_initial_db_config() -> DbConfig {
     }
 }
 
+pub fn save_db_config_to_path(config: &DbConfig, path: &std::path::Path) -> Result<(), String> {
+    let content = format!(
+        "PG_HOST={}\nPG_PORT={}\nPG_USER={}\nPG_PASSWORD={}\nPG_DBNAME={}\n",
+        config.host, config.port, config.user, config.password, config.dbname
+    );
+    std::fs::write(path, content).map_err(|e| format!("Błąd zapisu pliku .env: {}", e))
+}
+
 fn save_db_config_to_env(config: &DbConfig) -> Result<(), String> {
     std::env::set_var("PG_HOST", &config.host);
     std::env::set_var("PG_PORT", config.port.to_string());
@@ -131,25 +160,18 @@ fn save_db_config_to_env(config: &DbConfig) -> Result<(), String> {
     std::env::set_var("PG_PASSWORD", &config.password);
     std::env::set_var("PG_DBNAME", &config.dbname);
 
-    let content = format!(
-        "PG_HOST={}\nPG_PORT={}\nPG_USER={}\nPG_PASSWORD={}\nPG_DBNAME={}\n",
-        config.host, config.port, config.user, config.password, config.dbname
-    );
-
     let paths = [
         std::path::PathBuf::from(".env"),
         std::path::PathBuf::from("../.env"),
     ];
     let mut written = false;
     for p in &paths {
-        if p.exists() {
-            if let Ok(()) = std::fs::write(p, &content) {
-                written = true;
-            }
+        if p.exists() && save_db_config_to_path(config, p).is_ok() {
+            written = true;
         }
     }
     if !written {
-        std::fs::write(".env", &content).map_err(|e| format!("Błąd zapisu pliku .env: {}", e))?;
+        save_db_config_to_path(config, std::path::Path::new(".env"))?;
     }
     Ok(())
 }
@@ -328,7 +350,7 @@ pub fn create_dbc_parser() -> can_decode::Parser {
 
 /// Decode a single CAN frame into the aggregated CanReadData struct using DBC definitions.
 /// Automatically handles bit unpacking, byte order, signed values, scaling factors, and offsets.
-fn decode_can_frame(
+pub fn decode_can_frame(
     parser: &can_decode::Parser,
     data: &mut CanReadData,
     id: u32,
@@ -494,20 +516,28 @@ fn decode_can_frame(
 
 // ── CAN receive stream (CAN tab) ──
 
-fn get_preferred_pcan_channel() -> Option<u16> {
-    std::env::var("PCAN_CHANNEL").ok().and_then(|v| {
-        if v.starts_with("0x") || v.starts_with("0X") {
-            u16::from_str_radix(&v[2..], 16).ok()
-        } else if let Ok(num) = v.parse::<u16>() {
-            if num < 0x50 {
-                Some(0x50 + num) // e.g. "1" -> 0x51, "2" -> 0x52
-            } else {
-                Some(num)
-            }
-        } else {
+/// Parses PCAN channel specification (e.g. "1" -> 0x51, "0x52" -> 0x52).
+pub fn parse_pcan_channel(v: &str) -> Option<u16> {
+    let trimmed = v.trim();
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        u16::from_str_radix(&trimmed[2..], 16).ok()
+    } else if let Ok(num) = trimmed.parse::<u16>() {
+        if num == 0 {
             None
+        } else if num < 0x50 {
+            Some(0x50 + num) // e.g. "1" -> 0x51, "2" -> 0x52
+        } else {
+            Some(num)
         }
-    })
+    } else {
+        None
+    }
+}
+
+fn get_preferred_pcan_channel() -> Option<u16> {
+    std::env::var("PCAN_CHANNEL")
+        .ok()
+        .and_then(|v| parse_pcan_channel(&v))
 }
 
 fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<PcanDriver>>>>) {
@@ -595,9 +625,7 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
                     }
                     Ok(None) => break, // buffer empty
                     Err(err) => {
-                        const FATAL_MASK: u32 =
-                            0x04000000 | 0x00001400 | 0x00000200 | 0x00000100 | 0x00001800 | 0x00001C00;
-                        if (err & FATAL_MASK) != 0 || !driver.is_hardware_ok() {
+                        if !is_status_hardware_ok(err) || !driver.is_hardware_ok() {
                             eprintln!("[CAN] Błąd odczytu 0x{:05X} — adapter odłączony!", err);
                             hardware_lost = true;
                         } else {
@@ -624,26 +652,93 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
     });
 }
 
-// ── CAN send commands ──
+// ── Pure encoding & validation helpers ──
 
-/// Send a single FCCU command (instant toggle).
-/// command_type: "system_enable" | "main_valve" | "manual_purge" | "fan_on"
-/// state: true = ON (0x01), false = OFF (0x00)
-#[tauri::command]
-fn send_fccu_command(
-    command_type: String,
+/// Encodes an FCCU toggle command into `(can_id, message_name, payload)`.
+pub fn encode_fccu_command(
+    command_type: &str,
     state: bool,
-    can_state: State<'_, CanState>,
-) -> Result<String, String> {
-    let (can_id, name) = match command_type.as_str() {
+) -> Result<(u32, &'static str, [u8; 1]), String> {
+    let (can_id, name) = match command_type {
         "system_enable" => (0x510u32, "FCCU_SYSTEM_ENABLE"),
         "main_valve" => (0x511, "FCCU_MAIN_VALVE_COMMAND"),
         "manual_purge" => (0x512, "FCCU_MANUAL_PURGE"),
         "fan_on" => (0x513, "FCCU_FAN"),
         _ => return Err(format!("Nieznana komenda FCCU: {}", command_type)),
     };
+    Ok((can_id, name, [state as u8]))
+}
 
-    let payload = [state as u8];
+/// Encodes FCCU fan & purge valve settings into `(FCCU_FAN_SETTINGS 0x520, FCCU_VALVE_SETTINGS 0x521)` payloads.
+pub fn encode_fccu_settings(
+    fan_mode: u8,
+    purge_interval: u16,
+    p_gain: u16,
+    i_gain: u16,
+    d_gain: u16,
+) -> ([u8; 8], [u8; 4]) {
+    let fan_data: [u8; 8] = [
+        fan_mode & 0x03,
+        0x00,
+        (p_gain & 0xFF) as u8,
+        ((p_gain >> 8) & 0xFF) as u8,
+        (i_gain & 0xFF) as u8,
+        ((i_gain >> 8) & 0xFF) as u8,
+        (d_gain & 0xFF) as u8,
+        ((d_gain >> 8) & 0xFF) as u8,
+    ];
+
+    let valve_data: [u8; 4] = [
+        (purge_interval & 0xFF) as u8,
+        ((purge_interval >> 8) & 0xFF) as u8,
+        100u8,
+        0x00,
+    ];
+
+    (fan_data, valve_data)
+}
+
+/// Encodes vehicle lighting flags into the `MCU_LIGHTING (0x400)` single-byte payload.
+pub fn encode_lighting(
+    headlight: bool,
+    position_light: bool,
+    brake_light: bool,
+    left_indicator: bool,
+    right_indicator: bool,
+    hazard: bool,
+) -> u8 {
+    (headlight as u8)
+        | ((position_light as u8) << 1)
+        | ((brake_light as u8) << 2)
+        | ((left_indicator as u8) << 3)
+        | ((right_indicator as u8) << 4)
+        | ((hazard as u8) << 5)
+}
+
+/// Validates PostgreSQL connection settings before saving.
+pub fn validate_db_config(config: &DbConfig) -> Result<(), String> {
+    if config.host.trim().is_empty() {
+        return Err("Host nie może być pusty".to_string());
+    }
+    if config.port == 0 {
+        return Err("Port musi być w zakresie 1-65535".to_string());
+    }
+    if config.dbname.trim().is_empty() {
+        return Err("Nazwa bazy danych nie może być pusta".to_string());
+    }
+    if config.user.trim().is_empty() {
+        return Err("Użytkownik nie może być pusty".to_string());
+    }
+    Ok(())
+}
+
+/// Executes FCCU command transmission against shared `CanState`.
+pub fn execute_fccu_command(
+    command_type: &str,
+    state: bool,
+    can_state: &CanState,
+) -> Result<String, String> {
+    let (can_id, name, payload) = encode_fccu_command(command_type, state)?;
     println!(
         "[CAN TX] {} (0x{:08X}): [0x{:02X}] → {}",
         name,
@@ -668,34 +763,17 @@ fn send_fccu_command(
     ))
 }
 
-/// Send FCCU settings
-/// DBC messages: FCCU_FAN_SETTINGS (0x80000520 → 0x520) and FCCU_VALVE_SETTINGS (0x80000521 → 0x521)
-#[tauri::command]
-fn send_fccu_settings(
+/// Executes FCCU fan & valve settings transmission against shared `CanState`.
+pub fn execute_fccu_settings(
     fan_mode: u8,
     purge_interval: u16,
     p_gain: u16,
     i_gain: u16,
     d_gain: u16,
-    can_state: State<'_, CanState>,
+    can_state: &CanState,
 ) -> Result<String, String> {
-    let fan_data: [u8; 8] = [
-        (fan_mode & 0x03) as u8,
-        0x00,
-        (p_gain & 0xFF) as u8,
-        ((p_gain >> 8) & 0xFF) as u8,
-        (i_gain & 0xFF) as u8,
-        ((i_gain >> 8) & 0xFF) as u8,
-        (d_gain & 0xFF) as u8,
-        ((d_gain >> 8) & 0xFF) as u8,
-    ];
-
-    let valve_data: [u8; 4] = [
-        (purge_interval & 0xFF) as u8,
-        ((purge_interval >> 8) & 0xFF) as u8,
-        100u8,
-        0x00,
-    ];
+    let (fan_data, valve_data) =
+        encode_fccu_settings(fan_mode, purge_interval, p_gain, i_gain, d_gain);
 
     println!(
         "[CAN TX] FCCU_FAN_SETTINGS (0x520): {:02X?}  (fan_mode={}, P={}, I={}, D={})",
@@ -724,24 +802,24 @@ fn send_fccu_settings(
     ))
 }
 
-/// Send MCU lighting commands
-/// DBC message: MCU_LIGHTING (0x80000400 → 0x400)
-#[tauri::command]
-fn send_lighting(
+/// Executes lighting frame transmission against shared `CanState`.
+pub fn execute_lighting(
     headlight: bool,
     position_light: bool,
     brake_light: bool,
     left_indicator: bool,
     right_indicator: bool,
     hazard: bool,
-    can_state: State<'_, CanState>,
+    can_state: &CanState,
 ) -> Result<String, String> {
-    let byte0: u8 = (headlight as u8)
-        | ((position_light as u8) << 1)
-        | ((brake_light as u8) << 2)
-        | ((left_indicator as u8) << 3)
-        | ((right_indicator as u8) << 4)
-        | ((hazard as u8) << 5);
+    let byte0 = encode_lighting(
+        headlight,
+        position_light,
+        brake_light,
+        left_indicator,
+        right_indicator,
+        hazard,
+    );
 
     println!(
         "[CAN TX] MCU_LIGHTING (0x400): [0x{:02X}]  H={} P={} B={} L={} R={} Hz={}",
@@ -763,8 +841,8 @@ fn send_lighting(
     ))
 }
 
-#[tauri::command]
-fn get_can_status(can_state: State<'_, CanState>) -> bool {
+/// Reads current CAN hardware connectivity from `CanState`.
+pub fn read_can_status(can_state: &CanState) -> bool {
     can_state
         .0
         .read()
@@ -777,9 +855,87 @@ fn get_can_status(can_state: State<'_, CanState>) -> bool {
         .unwrap_or(false)
 }
 
+/// Validates and propagates updated DB configuration into `DbConfigState` (and optionally a `.env` file path).
+pub fn apply_db_config(
+    config: DbConfig,
+    state: &DbConfigState,
+    env_path: Option<&std::path::Path>,
+) -> Result<String, String> {
+    validate_db_config(&config)?;
+    match env_path {
+        Some(path) => save_db_config_to_path(&config, path)?,
+        None => save_db_config_to_env(&config)?,
+    }
+    let _ = state.tx.send(config);
+    Ok("Dane zapisane pomyślnie. Trwa łączenie z bazą...".to_string())
+}
+
+// ── CAN send commands ──
+
+/// Send a single FCCU command (instant toggle).
+/// command_type: "system_enable" | "main_valve" | "manual_purge" | "fan_on"
+/// state: true = ON (0x01), false = OFF (0x00)
 #[tauri::command]
-async fn reconnect_pcan(
-    app_handle: AppHandle,
+fn send_fccu_command(
+    command_type: String,
+    state: bool,
+    can_state: State<'_, CanState>,
+) -> Result<String, String> {
+    execute_fccu_command(&command_type, state, &can_state)
+}
+
+/// Send FCCU settings
+/// DBC messages: FCCU_FAN_SETTINGS (0x80000520 → 0x520) and FCCU_VALVE_SETTINGS (0x80000521 → 0x521)
+#[tauri::command]
+fn send_fccu_settings(
+    fan_mode: u8,
+    purge_interval: u16,
+    p_gain: u16,
+    i_gain: u16,
+    d_gain: u16,
+    can_state: State<'_, CanState>,
+) -> Result<String, String> {
+    execute_fccu_settings(
+        fan_mode,
+        purge_interval,
+        p_gain,
+        i_gain,
+        d_gain,
+        &can_state,
+    )
+}
+
+/// Send MCU lighting commands
+/// DBC message: MCU_LIGHTING (0x80000400 → 0x400)
+#[tauri::command]
+fn send_lighting(
+    headlight: bool,
+    position_light: bool,
+    brake_light: bool,
+    left_indicator: bool,
+    right_indicator: bool,
+    hazard: bool,
+    can_state: State<'_, CanState>,
+) -> Result<String, String> {
+    execute_lighting(
+        headlight,
+        position_light,
+        brake_light,
+        left_indicator,
+        right_indicator,
+        hazard,
+        &can_state,
+    )
+}
+
+#[tauri::command]
+fn get_can_status(can_state: State<'_, CanState>) -> bool {
+    read_can_status(&can_state)
+}
+
+#[tauri::command]
+async fn reconnect_pcan<R: Runtime>(
+    app_handle: AppHandle<R>,
     can_state: State<'_, CanState>,
 ) -> Result<String, String> {
     let preferred_channel = get_preferred_pcan_channel();
@@ -825,19 +981,21 @@ async fn save_db_config(
     config: DbConfig,
     state: State<'_, DbConfigState>,
 ) -> Result<String, String> {
-    if config.host.trim().is_empty() {
-        return Err("Host nie może być pusty".to_string());
-    }
-    if config.dbname.trim().is_empty() {
-        return Err("Nazwa bazy danych nie może być pusta".to_string());
-    }
-    if config.user.trim().is_empty() {
-        return Err("Użytkownik nie może być pusty".to_string());
-    }
+    apply_db_config(config, &state, None)
+}
 
-    save_db_config_to_env(&config)?;
-    let _ = state.tx.send(config);
-    Ok("Dane zapisane pomyślnie. Trwa łączenie z bazą...".to_string())
+/// Registers all application Tauri IPC command handlers onto any runtime builder (Wry or MockRuntime).
+pub fn register_app_handlers<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder.invoke_handler(tauri::generate_handler![
+        send_fccu_command,
+        send_fccu_settings,
+        send_lighting,
+        get_db_config,
+        get_db_status,
+        save_db_config,
+        get_can_status,
+        reconnect_pcan,
+    ])
 }
 
 // ── App entry point ──
@@ -856,19 +1014,11 @@ pub fn run() {
         status: db_status.clone(),
     };
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .manage(db_state)
-        .invoke_handler(tauri::generate_handler![
-            send_fccu_command,
-            send_fccu_settings,
-            send_lighting,
-            get_db_config,
-            get_db_status,
-            save_db_config,
-            get_can_status,
-            reconnect_pcan,
-        ])
+    register_app_handlers(
+        tauri::Builder::default()
+            .plugin(tauri_plugin_opener::init())
+            .manage(db_state),
+    )
         .setup(move |app| {
             let app_handle = app.handle().clone();
             let can_handle = app.handle().clone();
@@ -919,33 +1069,20 @@ mod tests {
 
         let mut data = CanReadData::default();
 
-        // Test decoding MCU_ANALOG_FUEL_CELL (0x104):
-        // FUEL_CELL_OUTPUT_CURRENT: start_bit=0, len=16, signed, factor=0.001
-        // FUEL_CELL_OUTPUT_VOLTAGE: start_bit=16, len=16, signed, factor=0.001
-        // HYDROGEN_HIGH_PRESSURE: start_bit=32, len=16, unsigned, factor=0.1
-        let current_raw: i16 = 15200; // 15.2 A
-        let voltage_raw: i16 = 25000; // 25.0 V
-        let pressure_raw: u16 = 3000; // 300.0 bar
+        // MCU_ANALOG_FUEL_CELL (0x104): current=15.2A, voltage=25.0V, pressure=300.0 bar
         let mut payload = [0u8; 8];
-        payload[0..2].copy_from_slice(&current_raw.to_le_bytes());
-        payload[2..4].copy_from_slice(&voltage_raw.to_le_bytes());
-        payload[4..6].copy_from_slice(&pressure_raw.to_le_bytes());
-
+        payload[0..2].copy_from_slice(&15200i16.to_le_bytes());
+        payload[2..4].copy_from_slice(&25000i16.to_le_bytes());
+        payload[4..6].copy_from_slice(&3000u16.to_le_bytes());
         decode_can_frame(&parser, &mut data, 0x104, &payload);
 
         assert!((data.fc_output_current - 15.2).abs() < 1e-3);
         assert!((data.fc_output_voltage - 25.0).abs() < 1e-3);
         assert!((data.h2_high_pressure - 300.0).abs() < 1e-3);
 
-        // Test decoding FCCU_STATE (0x500):
-        // STATE: 0|4@1+ (1,0)
-        // MAIN_VALVE: 4|1@1+ (1,0)
-        // PURGE_VALVE: 5|1@1+ (1,0)
-        // FAN_STATE: 6|1@1+ (1,0)
-        // FAN_DUTY: 8|8@1+ (1,0)
-        let state_byte = 2 | (1 << 4) | (1 << 6); // state=2 (RUNNING), main_valve=1, fan=1
-        let duty_byte = 75u8;
-        let payload2 = [state_byte, duty_byte, 0, 0, 0, 0, 0, 0];
+        // FCCU_STATE (0x500): state=2 (RUNNING), main_valve=1, fan=1, fan_duty=75
+        let state_byte = 2 | (1 << 4) | (1 << 6);
+        let payload2 = [state_byte, 75u8, 0, 0, 0, 0, 0, 0];
         decode_can_frame(&parser, &mut data, 0x500, &payload2);
 
         assert_eq!(data.fccu_state, 2);
@@ -953,5 +1090,175 @@ mod tests {
         assert!(!data.fccu_purge_valve);
         assert!(data.fccu_fan_state);
         assert_eq!(data.fccu_fan_duty, 75);
+    }
+
+    #[test]
+    fn test_decode_all_remaining_dbc_frames() {
+        let parser = create_dbc_parser();
+        let mut data = CanReadData::default();
+
+        // MCU_STATE (0x100): status=3, vehicle_type=1, motor_controller_enabled (bit 14), main_valve_enabled (bit 15)
+        let mcu_byte0 = (1u8 << 4) | 3u8;
+        let mcu_byte1 = (1u8 << 6) | (1u8 << 7);
+        decode_can_frame(&parser, &mut data, 0x100, &[mcu_byte0, mcu_byte1]);
+        assert_eq!(data.mcu_status, 3);
+        assert_eq!(data.vehicle_type, 1);
+        assert!(data.motor_controller_enabled);
+        assert!(data.main_valve_enabled);
+
+        // MCU_ANALOG_POWERTRAIN (0x105)
+        let mut pt = [0u8; 8];
+        pt[0..2].copy_from_slice(&28500i16.to_le_bytes()); // SC V: 28.5 V
+        pt[2..4].copy_from_slice(&1230i16.to_le_bytes());  // SC A: 12.3 A
+        pt[4..6].copy_from_slice(&8400i16.to_le_bytes());  // MC A: 8.4 A
+        pt[6..8].copy_from_slice(&31200i16.to_le_bytes()); // MC V: 31.2 V
+        decode_can_frame(&parser, &mut data, 0x105, &pt);
+        assert!((data.sc_voltage - 28.5).abs() < 1e-3);
+        assert!((data.sc_current - 12.3).abs() < 1e-2);
+        assert!((data.mc_supply_current - 8.4).abs() < 1e-3);
+        assert!((data.mc_supply_voltage - 31.2).abs() < 1e-3);
+
+        // MCU_ANALOG_ACCESSORY (0x106)
+        let mut acc = [0u8; 4];
+        acc[0..2].copy_from_slice(&2150i16.to_le_bytes());  // 2.15 A
+        acc[2..4].copy_from_slice(&12600i16.to_le_bytes()); // 12.6 V
+        decode_can_frame(&parser, &mut data, 0x106, &acc);
+        assert!((data.ab_current - 2.15).abs() < 1e-3);
+        assert!((data.ab_voltage - 12.6).abs() < 1e-3);
+
+        // MCU_ANALOG_DRIVE (0x107)
+        let mut drv = [0u8; 4];
+        drv[0..2].copy_from_slice(&3200u16.to_le_bytes()); // 3200 rpm
+        drv[2..4].copy_from_slice(&4250u16.to_le_bytes()); // 42.5 km/h
+        decode_can_frame(&parser, &mut data, 0x107, &drv);
+        assert!((data.rpm - 3200.0).abs() < 1e-3);
+        assert!((data.speed - 42.5).abs() < 1e-2);
+
+        // PROTIUM_POWER (0x200)
+        let mut prot = [0u8; 8];
+        prot[0..2].copy_from_slice(&4750i16.to_le_bytes()); // 47.5 V
+        prot[2..4].copy_from_slice(&1050i16.to_le_bytes()); // 10.5 A
+        prot[4..6].copy_from_slice(&499i16.to_le_bytes());  // 499 W
+        prot[6..8].copy_from_slice(&120u16.to_le_bytes());  // 120 Wh
+        decode_can_frame(&parser, &mut data, 0x200, &prot);
+        assert!((data.fc_output_voltage - 47.5).abs() < 1e-2);
+        assert!((data.fc_output_current - 10.5).abs() < 1e-2);
+        assert!((data.fc_w - 499.0).abs() < 1e-3);
+        assert!((data.energy_wh - 120.0).abs() < 1e-3);
+
+        // FCCU_VERSION (0x501)
+        decode_can_frame(&parser, &mut data, 0x501, &[2, 4, 15, 0, 0, 0, 0, 0]);
+        assert_eq!(data.fccu_version, "v2.4.15");
+
+        // FCCU_HYDROGEN (0x502)
+        let mut h2 = [0u8; 8];
+        h2[0..2].copy_from_slice(&1234u16.to_le_bytes()); // 12.34 Ln/min
+        h2[2..4].copy_from_slice(&150u16.to_le_bytes());  // 1.50 bar
+        decode_can_frame(&parser, &mut data, 0x502, &h2);
+        assert!((data.h2_flow - 12.34).abs() < 1e-2);
+        assert!((data.h2_lp_pressure - 1.5).abs() < 1e-2);
+
+        // FCCU_POWER (0x503) — also calculates fc_w = V * A
+        let mut fpow = [0u8; 8];
+        fpow[0..2].copy_from_slice(&4500i16.to_le_bytes()); // 45.0 V
+        fpow[2..4].copy_from_slice(&1000i16.to_le_bytes()); // 10.0 A
+        fpow[4..6].copy_from_slice(&2400i16.to_le_bytes()); // 24.0 V
+        fpow[6..8].copy_from_slice(&500i16.to_le_bytes());  // 5.0 A
+        decode_can_frame(&parser, &mut data, 0x503, &fpow);
+        assert!((data.fccu_fc_voltage - 45.0).abs() < 1e-2);
+        assert!((data.fccu_fc_current - 10.0).abs() < 1e-2);
+        assert!((data.fc_w - 450.0).abs() < 1e-2);
+        assert!((data.fccu_dcdc_voltage - 24.0).abs() < 1e-2);
+        assert!((data.fccu_dcdc_current - 5.0).abs() < 1e-2);
+
+        // FCCU_ENVIRONMENT (0x504)
+        let mut env = [0u8; 8];
+        env[0..2].copy_from_slice(&5525i16.to_le_bytes()); // 55.25 C
+        env[2..4].copy_from_slice(&2250i16.to_le_bytes()); // 22.50 C
+        env[4..6].copy_from_slice(&4810u16.to_le_bytes()); // 48.10 %
+        decode_can_frame(&parser, &mut data, 0x504, &env);
+        assert!((data.fc_temp - 55.25).abs() < 1e-2);
+        assert!((data.ambient_temp - 22.50).abs() < 1e-2);
+        assert!((data.ambient_humidity - 48.10).abs() < 1e-2);
+
+        // Unknown frame ID should leave data untouched
+        let snapshot = data.clone();
+        decode_can_frame(&parser, &mut data, 0x7FF, &[0xFF; 8]);
+        assert_eq!(data, snapshot);
+    }
+
+    #[test]
+    fn test_encode_fccu_commands() {
+        assert_eq!(
+            encode_fccu_command("system_enable", true).unwrap(),
+            (0x510, "FCCU_SYSTEM_ENABLE", [0x01])
+        );
+        assert_eq!(
+            encode_fccu_command("main_valve", false).unwrap(),
+            (0x511, "FCCU_MAIN_VALVE_COMMAND", [0x00])
+        );
+        assert_eq!(
+            encode_fccu_command("manual_purge", true).unwrap(),
+            (0x512, "FCCU_MANUAL_PURGE", [0x01])
+        );
+        assert_eq!(
+            encode_fccu_command("fan_on", false).unwrap(),
+            (0x513, "FCCU_FAN", [0x00])
+        );
+        assert!(encode_fccu_command("invalid_cmd", true).is_err());
+    }
+
+    #[test]
+    fn test_encode_fccu_settings() {
+        let (fan_data, valve_data) = encode_fccu_settings(2, 300, 1000, 500, 255);
+        assert_eq!(fan_data[0], 2);
+        assert_eq!(fan_data[1], 0);
+        assert_eq!(u16::from_le_bytes([fan_data[2], fan_data[3]]), 1000);
+        assert_eq!(u16::from_le_bytes([fan_data[4], fan_data[5]]), 500);
+        assert_eq!(u16::from_le_bytes([fan_data[6], fan_data[7]]), 255);
+
+        assert_eq!(u16::from_le_bytes([valve_data[0], valve_data[1]]), 300);
+        assert_eq!(u16::from_le_bytes([valve_data[2], valve_data[3]]), 100);
+
+        // Fan mode masked to 2 bits
+        let (masked_fan, _) = encode_fccu_settings(0xFF, 10, 0, 0, 0);
+        assert_eq!(masked_fan[0], 0x03);
+    }
+
+    #[test]
+    fn test_encode_lighting_bitmask() {
+        assert_eq!(encode_lighting(false, false, false, false, false, false), 0x00);
+        assert_eq!(encode_lighting(true, false, false, false, false, false), 0b0000_0001);
+        assert_eq!(encode_lighting(false, true, false, true, false, true), 0b0010_1010);
+        assert_eq!(encode_lighting(true, true, true, true, true, true), 0b0011_1111);
+    }
+
+    #[test]
+    fn test_parse_pcan_channel() {
+        assert_eq!(parse_pcan_channel("1"), Some(0x51));
+        assert_eq!(parse_pcan_channel("2"), Some(0x52));
+        assert_eq!(parse_pcan_channel("0x53"), Some(0x53));
+        assert_eq!(parse_pcan_channel("0X58"), Some(0x58));
+        assert_eq!(parse_pcan_channel("81"), Some(0x51));
+        assert_eq!(parse_pcan_channel("0"), None);
+        assert_eq!(parse_pcan_channel("invalid"), None);
+    }
+
+    #[test]
+    fn test_validate_db_config() {
+        let valid = DbConfig::default();
+        assert!(validate_db_config(&valid).is_ok());
+
+        let empty_host = DbConfig { host: "   ".into(), ..valid.clone() };
+        assert!(validate_db_config(&empty_host).is_err());
+
+        let zero_port = DbConfig { port: 0, ..valid.clone() };
+        assert!(validate_db_config(&zero_port).is_err());
+
+        let empty_db = DbConfig { dbname: "".into(), ..valid.clone() };
+        assert!(validate_db_config(&empty_db).is_err());
+
+        let empty_user = DbConfig { user: "".into(), ..valid };
+        assert!(validate_db_config(&empty_user).is_err());
     }
 }

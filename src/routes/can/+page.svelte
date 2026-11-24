@@ -4,7 +4,18 @@
   import { listen } from '@tauri-apps/api/event';
   import { invoke } from '@tauri-apps/api/core';
   import Plotly from 'plotly.js-dist-min';
-  import { baseLayout, plotlyOptions, MAX_POINTS, fmtVal, calcAvg, calcRms } from '$lib/chartUtils';
+  import {
+    baseLayout,
+    plotlyOptions,
+    CAN_WINDOW_MS,
+    CAN_MAX_POINTS,
+    formatPlotlyTimestamp,
+    pruneWindowSamples,
+    fmtVal,
+    calcAvg,
+    calcRms,
+    type TimedSample
+  } from '$lib/chartUtils';
   import { canConnected } from '$lib/stores';
   import type { CanReadData, FccuSettings, LightingState } from '$lib/types';
 
@@ -12,15 +23,27 @@
   let canChart2: HTMLElement;
   let canChartsInitialized = false;
 
+  function buildCanXAxisRange(nowMs: number): [string, string] {
+    return [
+      formatPlotlyTimestamp(nowMs - CAN_WINDOW_MS),
+      formatPlotlyTimestamp(nowMs)
+    ];
+  }
+
+  const initialRange = buildCanXAxisRange(Date.now());
+
   const canChartLayout = {
     ...baseLayout,
     margin: { t: 8, r: 8, l: 38, b: 24 },
     showlegend: false,
     xaxis: {
+      type: 'date',
       gridcolor: '#27272a',
       zeroline: false,
       tickfont: { color: '#71717a' },
-      autorange: true
+      tickformat: '%H:%M:%S',
+      autorange: false,
+      range: initialRange
     },
     yaxis: {
       gridcolor: '#27272a',
@@ -46,8 +69,8 @@
     chart1: { newest: 0, average: 0, rms: 0 },
     chart2: { newest: 0, average: 0, rms: 0 }
   };
-  let chart1History: number[] = [];
-  let chart2History: number[] = [];
+  let chart1Samples: TimedSample[] = [];
+  let chart2Samples: TimedSample[] = [];
 
   let hasCanData = false;
   let fccuState = 3;
@@ -240,6 +263,12 @@
     fccuFanState = false;
     fccuFanDuty = 0;
     fccuVersion = '—';
+    chart1Samples = [];
+    chart2Samples = [];
+    canStats = {
+      chart1: { newest: 0, average: 0, rms: 0 },
+      chart2: { newest: 0, average: 0, rms: 0 }
+    };
     (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
       if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
     });
@@ -278,7 +307,7 @@
     const unlistenCan = listen<CanReadData>('can-data-update', (event) => {
       if (!$canConnected) return;
       const d = event.payload;
-      const now = new Date().toLocaleTimeString();
+      const nowMs = Date.now();
 
       hasCanData = true;
 
@@ -329,18 +358,42 @@
       if (d.fccu_fan_duty !== undefined) fccuFanDuty = d.fccu_fan_duty;
       if (d.fccu_version && d.fccu_version.trim().length > 0) fccuVersion = d.fccu_version;
 
-      if (canChartsInitialized && canChart1) {
-        Plotly.extendTraces(canChart1, { x: [[now]], y: [[d.fc_output_voltage ?? 0]] }, [0], MAX_POINTS);
-        Plotly.extendTraces(canChart2, { x: [[now]], y: [[d.fc_output_current ?? 0]] }, [0], MAX_POINTS);
+      if (canChartsInitialized && canChart1 && canChart2) {
+        const voltage = d.fc_output_voltage ?? 0;
+        const current = d.fc_output_current ?? 0;
 
-        chart1History.push(d.fc_output_voltage ?? 0);
-        chart2History.push(d.fc_output_current ?? 0);
-        if (chart1History.length > MAX_POINTS) chart1History.shift();
-        if (chart2History.length > MAX_POINTS) chart2History.shift();
+        chart1Samples = pruneWindowSamples(
+          [...chart1Samples, { t: nowMs, v: voltage }],
+          nowMs,
+          CAN_WINDOW_MS,
+          CAN_MAX_POINTS
+        );
+        chart2Samples = pruneWindowSamples(
+          [...chart2Samples, { t: nowMs, v: current }],
+          nowMs,
+          CAN_WINDOW_MS,
+          CAN_MAX_POINTS
+        );
 
+        const xRange = buildCanXAxisRange(nowMs);
+        Plotly.update(
+          canChart1,
+          { x: [chart1Samples.map((s) => formatPlotlyTimestamp(s.t))], y: [chart1Samples.map((s) => s.v)] },
+          { 'xaxis.range': xRange },
+          [0]
+        );
+        Plotly.update(
+          canChart2,
+          { x: [chart2Samples.map((s) => formatPlotlyTimestamp(s.t))], y: [chart2Samples.map((s) => s.v)] },
+          { 'xaxis.range': xRange },
+          [0]
+        );
+
+        const vValues = chart1Samples.map((s) => s.v);
+        const cValues = chart2Samples.map((s) => s.v);
         canStats = {
-          chart1: { newest: d.fc_output_voltage ?? 0, average: calcAvg(chart1History), rms: calcRms(chart1History) },
-          chart2: { newest: d.fc_output_current ?? 0, average: calcAvg(chart2History), rms: calcRms(chart2History) }
+          chart1: { newest: voltage, average: calcAvg(vValues), rms: calcRms(vValues) },
+          chart2: { newest: current, average: calcAvg(cValues), rms: calcRms(cValues) }
         };
       }
     });
