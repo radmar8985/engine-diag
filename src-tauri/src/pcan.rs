@@ -43,23 +43,12 @@ pub fn is_status_hardware_ok(status: u32) -> bool {
 // ── PCAN Structures (C ABI) ──
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TPCANMsg {
     pub id: u32,
     pub msg_type: u8,
     pub len: u8,
     pub data: [u8; 8],
-}
-
-impl Default for TPCANMsg {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            msg_type: 0,
-            len: 0,
-            data: [0u8; 8],
-        }
-    }
 }
 
 #[repr(C)]
@@ -122,77 +111,54 @@ impl PcanDriver {
             message: format!("Nie można załadować PCANBasic.dll: {}", e),
         })?;
 
-        let fn_init: FnInitialize;
-        let fn_uninit: FnUninitialize;
-        let fn_get_status: FnGetStatus;
-        let fn_read: FnRead;
-        let fn_write: FnWrite;
-
-        unsafe {
-            fn_init = **lib
-                .get::<Symbol<FnInitialize>>(b"CAN_Initialize\0")
-                .map_err(|e| PcanError {
-                    code: 0xFFFFFFFF,
-                    message: format!("Symbol CAN_Initialize not found: {}", e),
-                })?;
-            fn_uninit = **lib
-                .get::<Symbol<FnUninitialize>>(b"CAN_Uninitialize\0")
-                .map_err(|e| PcanError {
-                    code: 0xFFFFFFFF,
-                    message: format!("Symbol CAN_Uninitialize not found: {}", e),
-                })?;
-            fn_get_status = **lib
-                .get::<Symbol<FnGetStatus>>(b"CAN_GetStatus\0")
-                .map_err(|e| PcanError {
-                    code: 0xFFFFFFFF,
-                    message: format!("Symbol CAN_GetStatus not found: {}", e),
-                })?;
-            fn_read = **lib
-                .get::<Symbol<FnRead>>(b"CAN_Read\0")
-                .map_err(|e| PcanError {
-                    code: 0xFFFFFFFF,
-                    message: format!("Symbol CAN_Read not found: {}", e),
-                })?;
-            fn_write = **lib
-                .get::<Symbol<FnWrite>>(b"CAN_Write\0")
-                .map_err(|e| PcanError {
-                    code: 0xFFFFFFFF,
-                    message: format!("Symbol CAN_Write not found: {}", e),
-                })?;
+        macro_rules! load_sym {
+            ($ty:ty, $name:literal) => {
+                unsafe {
+                    **lib
+                        .get::<Symbol<$ty>>(concat!($name, "\0").as_bytes())
+                        .map_err(|e| PcanError {
+                            code: 0xFFFFFFFF,
+                            message: format!("Symbol {} not found: {}", $name, e),
+                        })?
+                }
+            };
         }
+
+        let fn_init = load_sym!(FnInitialize, "CAN_Initialize");
+        let fn_uninit = load_sym!(FnUninitialize, "CAN_Uninitialize");
+        let fn_get_status = load_sym!(FnGetStatus, "CAN_GetStatus");
+        let fn_read = load_sym!(FnRead, "CAN_Read");
+        let fn_write = load_sym!(FnWrite, "CAN_Write");
 
         // Build list of candidate channels
-        let mut candidates = Vec::new();
-        if let Some(pref) = preferred_channel {
-            candidates.push(pref);
-        }
-        for &ch in &PCAN_USB_CHANNELS {
+        let mut candidates: Vec<u16> = preferred_channel.into_iter().collect();
+        for ch in PCAN_USB_CHANNELS {
             if !candidates.contains(&ch) {
                 candidates.push(ch);
             }
         }
 
         let mut last_err = 0u32;
-        for &channel in &candidates {
+        for channel in candidates {
             let status = unsafe { fn_init(channel, baudrate, 0, 0, 0) };
-            if status == PCAN_ERROR_OK {
-                println!(
-                    "[PCAN] Znaleziono i zainicjalizowano wolny adapter na kanale 0x{:02X} (PCAN_USBBUS{}) @ baudrate 0x{:04X}",
-                    channel,
-                    (channel.saturating_sub(0x50)),
-                    baudrate
-                );
-                return Ok(Self {
-                    _lib: lib,
-                    channel,
-                    fn_read,
-                    fn_write,
-                    fn_uninit,
-                    fn_get_status,
-                });
-            } else {
+            if status != PCAN_ERROR_OK {
                 last_err = status;
+                continue;
             }
+            println!(
+                "[PCAN] Znaleziono i zainicjalizowano wolny adapter na kanale 0x{:02X} (PCAN_USBBUS{}) @ baudrate 0x{:04X}",
+                channel,
+                channel.saturating_sub(0x50),
+                baudrate
+            );
+            return Ok(Self {
+                _lib: lib,
+                channel,
+                fn_read,
+                fn_write,
+                fn_uninit,
+                fn_get_status,
+            });
         }
 
         Err(PcanError {
@@ -238,13 +204,14 @@ impl PcanDriver {
     /// Write a CAN message with Extended Frame (29-bit ID).
     /// `id` should be the 29-bit CAN ID (already masked, without 0x80000000 flag).
     pub fn write(&self, id: u32, data: &[u8]) -> Result<(), u32> {
+        let len = data.len().min(8);
         let mut msg = TPCANMsg {
             id,
             msg_type: PCAN_MESSAGE_EXTENDED,
-            len: data.len().min(8) as u8,
+            len: len as u8,
             data: [0u8; 8],
         };
-        msg.data[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
+        msg.data[..len].copy_from_slice(&data[..len]);
 
         let status = unsafe { (self.fn_write)(self.channel, &mut msg) };
         if status == PCAN_ERROR_OK {

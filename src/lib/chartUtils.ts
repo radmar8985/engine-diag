@@ -37,8 +37,8 @@ export function pruneWindowSamples(
 }
 
 export function fmtVal(v: number | undefined | null, decimals: number = 2): string {
-  if (v === undefined || v === null || isNaN(v)) return (0).toFixed(decimals).replace('.', ',');
-  return v.toFixed(decimals).replace('.', ',');
+  const n = v === undefined || v === null || isNaN(v) ? 0 : v;
+  return n.toFixed(decimals).replace('.', ',');
 }
 
 export function getStatus(value: number, config: { min: number; max: number }): string {

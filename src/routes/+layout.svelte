@@ -3,7 +3,7 @@
   import { page } from '$app/stores';
   import { listen } from '@tauri-apps/api/event';
   import { invoke } from '@tauri-apps/api/core';
-  import { currentReadings, canConnected, lastCanFrameTime, dbStatus } from '$lib/stores';
+  import { currentReadings, canConnected, lastCanFrameTime, dbStatus, emptyEngineData } from '$lib/stores';
   import { fmtVal, getStatus } from '$lib/chartUtils';
   import type { EngineData, CanReadData, DbStatus } from '$lib/types';
 
@@ -22,33 +22,55 @@
     power: { min: 0, max: 1000 }
   };
 
+  interface MetricCardDef {
+    label: string;
+    key: keyof EngineData;
+    unit: string;
+    decimals: number;
+    threshold: keyof typeof thresholds;
+    canActive: boolean;
+  }
+
+  const metricGroups: MetricCardDef[][] = [
+    [
+      { label: 'U_FC', key: 'voltage1', unit: 'V', decimals: 1, threshold: 'voltage', canActive: true },
+      { label: 'U_SC', key: 'voltage2', unit: 'V', decimals: 1, threshold: 'voltage', canActive: false },
+      { label: 'U_MC', key: 'voltage3', unit: 'V', decimals: 1, threshold: 'voltage', canActive: false }
+    ],
+    [
+      { label: 'I_FC', key: 'current1', unit: 'A', decimals: 1, threshold: 'current', canActive: true },
+      { label: 'I_SC', key: 'current2', unit: 'A', decimals: 1, threshold: 'current', canActive: false },
+      { label: 'I_MC', key: 'current3', unit: 'A', decimals: 1, threshold: 'current', canActive: false }
+    ],
+    [
+      { label: 'P_FC', key: 'power1', unit: 'W', decimals: 0, threshold: 'power', canActive: true },
+      { label: 'P_SC', key: 'power2', unit: 'W', decimals: 0, threshold: 'power', canActive: false },
+      { label: 'P_MC', key: 'power3', unit: 'W', decimals: 0, threshold: 'power', canActive: false }
+    ]
+  ];
+
+  const standaloneMetrics: MetricCardDef[] = [
+    { label: 'Temperatura', key: 'temperature', unit: '°C', decimals: 1, threshold: 'temperature', canActive: true },
+    { label: 'Prędkość obrotowa', key: 'rpm', unit: 'obr./min', decimals: 0, threshold: 'rpm', canActive: true }
+  ];
+
   function resetCanReadings() {
     lastCanFrameTime.set('—');
-    if ($page.url.pathname === '/can') {
-      currentReadings.set({
-        voltage1: 0,
-        voltage2: 0,
-        voltage3: 0,
-        current1: 0,
-        current2: 0,
-        current3: 0,
-        power1: 0,
-        power2: 0,
-        power3: 0,
-        temperature: 0,
-        rpm: 0
-      });
+    if (isCanTab) {
+      currentReadings.set(emptyEngineData());
+    }
+  }
+
+  function applyCanStatus(connected: boolean) {
+    canConnected.set(connected);
+    if (!connected) {
+      resetCanReadings();
     }
   }
 
   onMount(() => {
     invoke<boolean>('get_can_status')
-      .then((connected) => {
-        canConnected.set(connected);
-        if (!connected) {
-          resetCanReadings();
-        }
-      })
+      .then(applyCanStatus)
       .catch(() => {});
 
     invoke<DbStatus>('get_db_status')
@@ -57,15 +79,10 @@
       })
       .catch(() => {});
 
-    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => {
-      canConnected.set(event.payload);
-      if (!event.payload) {
-        resetCanReadings();
-      }
-    });
+    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => applyCanStatus(event.payload));
 
     const unlistenPg = listen<EngineData>('engine-data-update', (event) => {
-      if ($page.url.pathname !== '/can') {
+      if (!isCanTab) {
         currentReadings.set(event.payload);
       }
     });
@@ -75,7 +92,7 @@
       const d = event.payload;
       lastCanFrameTime.set(new Date().toLocaleTimeString());
 
-      if ($page.url.pathname === '/can') {
+      if (isCanTab) {
         currentReadings.set({
           voltage1: d.fc_output_voltage ?? 0,
           voltage2: d.sc_voltage ?? 0,
@@ -96,11 +113,9 @@
       dbStatus.set(event.payload);
     });
 
+    const unlisteners = [unlistenPg, unlistenCan, unlistenDb, unlistenCanStatus];
     return () => {
-      unlistenPg.then((u) => u());
-      unlistenCan.then((u) => u());
-      unlistenDb.then((u) => u());
-      unlistenCanStatus.then((u) => u());
+      unlisteners.forEach((p) => p.then((u) => u()));
     };
   });
 </script>
@@ -112,16 +127,10 @@
     <div class="section">
       <h2 class="section-title">Źródło danych</h2>
       <div class="source-buttons">
-        <a
-          href="/"
-          class="source-btn {$page.url.pathname === '/' || $page.url.pathname === '/grafana' ? 'active' : ''}"
-        >
+        <a href="/" class="source-btn {isCanTab || $page.url.pathname !== '/' && $page.url.pathname !== '/grafana' ? '' : 'active'}">
           Grafana
         </a>
-        <a
-          href="/can"
-          class="source-btn {$page.url.pathname === '/can' ? 'active' : ''}"
-        >
+        <a href="/can" class="source-btn {isCanTab ? 'active' : ''}">
           CAN
         </a>
       </div>
@@ -130,96 +139,29 @@
     <div class="section">
       <h2 class="section-title">Pomiary na żywo</h2>
 
-      <!-- Napięcia -->
-      <div class="metric-group">
+      {#snippet metricCard(m: MetricCardDef)}
+        {@const disabled = (!m.canActive && isCanTab) || !isCurrentSourceConnected}
+        {@const val = $currentReadings[m.key]}
         <div
-          class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.voltage1, thresholds.voltage)}"
-          class:disabled={!isCurrentSourceConnected}
+          class="metric-card status-{disabled ? 'disabled' : getStatus(val, thresholds[m.threshold])}"
+          class:disabled
         >
-          <div class="metric-header"><span class="metric-label">U_FC</span><div class="indicator"></div></div>
-          <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.voltage1, 1)} <span class="unit">V</span></div>
+          <div class="metric-header"><span class="metric-label">{m.label}</span><div class="indicator"></div></div>
+          <div class="metric-value">{disabled ? '—' : fmtVal(val, m.decimals)} <span class="unit">{m.unit}</span></div>
         </div>
-        <div
-          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.voltage2, thresholds.voltage)}"
-          class:disabled={isCanTab || !isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">U_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.voltage2, 1)} <span class="unit">V</span></div>
-        </div>
-        <div
-          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.voltage3, thresholds.voltage)}"
-          class:disabled={isCanTab || !isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">U_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.voltage3, 1)} <span class="unit">V</span></div>
-        </div>
-      </div>
+      {/snippet}
 
-      <!-- Prądy -->
-      <div class="metric-group">
-        <div
-          class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.current1, thresholds.current)}"
-          class:disabled={!isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">I_FC</span><div class="indicator"></div></div>
-          <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.current1, 1)} <span class="unit">A</span></div>
+      {#each metricGroups as group}
+        <div class="metric-group">
+          {#each group as m}
+            {@render metricCard(m)}
+          {/each}
         </div>
-        <div
-          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.current2, thresholds.current)}"
-          class:disabled={isCanTab || !isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">I_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.current2, 1)} <span class="unit">A</span></div>
-        </div>
-        <div
-          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.current3, thresholds.current)}"
-          class:disabled={isCanTab || !isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">I_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.current3, 1)} <span class="unit">A</span></div>
-        </div>
-      </div>
+      {/each}
 
-      <!-- Moce -->
-      <div class="metric-group">
-        <div
-          class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.power1, thresholds.power)}"
-          class:disabled={!isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">P_FC</span><div class="indicator"></div></div>
-          <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.power1, 0)} <span class="unit">W</span></div>
-        </div>
-        <div
-          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.power2, thresholds.power)}"
-          class:disabled={isCanTab || !isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">P_SC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.power2, 0)} <span class="unit">W</span></div>
-        </div>
-        <div
-          class="metric-card status-{isCanTab || !isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.power3, thresholds.power)}"
-          class:disabled={isCanTab || !isCurrentSourceConnected}
-        >
-          <div class="metric-header"><span class="metric-label">P_MC</span><div class="indicator"></div></div>
-          <div class="metric-value">{isCanTab || !isCurrentSourceConnected ? '—' : fmtVal($currentReadings.power3, 0)} <span class="unit">W</span></div>
-        </div>
-      </div>
-
-      <div
-        class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.temperature, thresholds.temperature)}"
-        class:disabled={!isCurrentSourceConnected}
-      >
-        <div class="metric-header"><span class="metric-label">Temperatura</span><div class="indicator"></div></div>
-        <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.temperature, 1)} <span class="unit">°C</span></div>
-      </div>
-
-      <div
-        class="metric-card status-{!isCurrentSourceConnected ? 'disabled' : getStatus($currentReadings.rpm, thresholds.rpm)}"
-        class:disabled={!isCurrentSourceConnected}
-      >
-        <div class="metric-header"><span class="metric-label">Prędkość obrotowa</span><div class="indicator"></div></div>
-        <div class="metric-value">{!isCurrentSourceConnected ? '—' : fmtVal($currentReadings.rpm, 0)} <span class="unit">obr./min</span></div>
-      </div>
+      {#each standaloneMetrics as m}
+        {@render metricCard(m)}
+      {/each}
     </div>
 
     <div class="section can-comm-section">

@@ -72,19 +72,7 @@ export interface CanReadData {
 /**
  * Sidebar live metric readings state
  */
-export interface CurrentReadings {
-  voltage1: number;
-  voltage2: number;
-  voltage3: number;
-  current1: number;
-  current2: number;
-  current3: number;
-  temperature: number;
-  rpm: number;
-  power1: number;
-  power2: number;
-  power3: number;
-}
+export type CurrentReadings = EngineData;
 
 /**
  * Metric threshold boundary range

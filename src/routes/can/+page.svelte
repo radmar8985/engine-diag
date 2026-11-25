@@ -17,7 +17,7 @@
     type TimedSample
   } from '$lib/chartUtils';
   import { canConnected } from '$lib/stores';
-  import type { CanReadData, FccuSettings, LightingState } from '$lib/types';
+  import type { CanReadData, ChartSeriesStats, FccuSettings, LightingState } from '$lib/types';
 
   let canChart1: HTMLElement;
   let canChart2: HTMLElement;
@@ -65,10 +65,7 @@
     }
   };
 
-  let canStats = {
-    chart1: { newest: 0, average: 0, rms: 0 },
-    chart2: { newest: 0, average: 0, rms: 0 }
-  };
+  let canStats = emptyCanStats();
   let chart1Samples: TimedSample[] = [];
   let chart2Samples: TimedSample[] = [];
 
@@ -80,34 +77,35 @@
   let fccuFanDuty = 0;
   let fccuVersion = '—';
 
+  const FCCU_STATES: Record<number, { label: string; color: string }> = {
+    0: { label: 'Inicjalizacja', color: '#3b82f6' },
+    1: { label: 'Uruchamianie', color: '#f59e0b' },
+    2: { label: 'Włączony', color: '#22c55e' },
+    3: { label: 'Wyłączony', color: '#f59e0b' }
+  };
+
   function getFccuStateLabel(state: number): string {
-    switch (state) {
-      case 0: return 'Inicjalizacja';
-      case 1: return 'Uruchamianie';
-      case 2: return 'Włączony';
-      case 3: return 'Wyłączony';
-      default: return 'Brak odczytu';
-    }
+    return FCCU_STATES[state]?.label ?? 'Brak odczytu';
   }
 
   function getFccuStateColor(state: number): string {
-    switch (state) {
-      case 0: return '#3b82f6';
-      case 1: return '#f59e0b';
-      case 2: return '#22c55e';
-      case 3: return '#f59e0b';
-      default: return '#71717a';
-    }
+    return FCCU_STATES[state]?.color ?? '#71717a';
   }
 
   type FccuCmdKey = 'system_enable' | 'main_valve' | 'manual_purge' | 'fan_on';
 
-  let pendingCmds: Record<FccuCmdKey, boolean> = {
-    system_enable: false,
-    main_valve: false,
-    manual_purge: false,
-    fan_on: false
-  };
+  function idlePendingCmds(): Record<FccuCmdKey, boolean> {
+    return { system_enable: false, main_valve: false, manual_purge: false, fan_on: false };
+  }
+
+  function emptyCanStats(): Record<'chart1' | 'chart2', ChartSeriesStats> {
+    return {
+      chart1: { newest: 0, average: 0, rms: 0 },
+      chart2: { newest: 0, average: 0, rms: 0 }
+    };
+  }
+
+  let pendingCmds = idlePendingCmds();
 
   let pendingTimeouts: Record<FccuCmdKey, ReturnType<typeof setTimeout> | null> = {
     system_enable: null,
@@ -120,6 +118,14 @@
 
   let isSendingSettings = false;
   let isSendingLighting = false;
+  let isSendingFanDuty = false;
+  let fanDutyCmd = 100;
+
+  function clampFanDuty(val: number): number {
+    const n = Number(val);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.min(100, Math.round(n)));
+  }
 
   let isReconnectingPcan = false;
 
@@ -173,16 +179,13 @@
   async function toggleFccuCmd(cmdType: FccuCmdKey) {
     if (pendingCmds[cmdType]) return;
 
-    let targetState = false;
-    if (cmdType === 'system_enable') {
-      targetState = !(fccuState === 2);
-    } else if (cmdType === 'main_valve') {
-      targetState = !fccuMainValve;
-    } else if (cmdType === 'manual_purge') {
-      targetState = !fccuPurgeValve;
-    } else if (cmdType === 'fan_on') {
-      targetState = !fccuFanState;
-    }
+    const currentStates: Record<FccuCmdKey, boolean> = {
+      system_enable: fccuState === 2,
+      main_valve: fccuMainValve,
+      manual_purge: fccuPurgeValve,
+      fan_on: fccuFanState
+    };
+    const targetState = !currentStates[cmdType];
 
     pendingCmds = { ...pendingCmds, [cmdType]: true };
     expectedStates[cmdType] = targetState;
@@ -199,10 +202,19 @@
     }, 4000);
 
     try {
-      const result = await invoke('send_fccu_command', {
-        commandType: cmdType,
-        state: targetState
-      });
+      const result =
+        cmdType === 'fan_on'
+          ? await invoke('send_fccu_fan', {
+              state: targetState,
+              duty: targetState ? (clampFanDuty(fanDutyCmd) || 100) : 0
+            })
+          : await invoke('send_fccu_command', {
+              commandType: cmdType,
+              state: targetState
+            });
+      if (cmdType === 'fan_on' && targetState && clampFanDuty(fanDutyCmd) === 0) {
+        fanDutyCmd = 100;
+      }
       showToast(result as string, false);
     } catch (e) {
       if (pendingTimeouts[cmdType]) {
@@ -214,46 +226,171 @@
     }
   }
 
+  async function sendFanDuty() {
+    const duty = clampFanDuty(fanDutyCmd);
+    fanDutyCmd = duty;
+    isSendingFanDuty = true;
+    await invokeWithToast(
+      'send_fccu_fan',
+      { state: duty > 0, duty },
+      () => (isSendingFanDuty = false)
+    );
+  }
+
+  async function invokeWithToast(command: string, args: Record<string, unknown>, onSettled: () => void) {
+    try {
+      const result = await invoke(command, args);
+      showToast(result as string, false);
+    } catch (e) {
+      showToast(`Błąd: ${e}`, true);
+    } finally {
+      setTimeout(onSettled, 500);
+    }
+  }
+
   async function sendFccuSettings() {
     isSendingSettings = true;
-    try {
-      const result = await invoke('send_fccu_settings', {
+    await invokeWithToast(
+      'send_fccu_settings',
+      {
         fanMode: fccuSettings.fanMode,
         purgeInterval: fccuSettings.purgeInterval,
         pGain: fccuSettings.pGain,
         iGain: fccuSettings.iGain,
         dGain: fccuSettings.dGain
-      });
-      showToast(result as string, false);
-    } catch (e) {
-      showToast(`Błąd: ${e}`, true);
-    } finally {
-      setTimeout(() => {
-        isSendingSettings = false;
-      }, 500);
-    }
+      },
+      () => (isSendingSettings = false)
+    );
   }
 
   async function sendLightingCmd() {
     isSendingLighting = true;
-    try {
-      const result = await invoke('send_lighting', {
+    await invokeWithToast(
+      'send_lighting',
+      {
         headlight: lighting.headlight,
         positionLight: lighting.positionLight,
         brakeLight: lighting.brakeLight,
         leftIndicator: lighting.leftIndicator,
         rightIndicator: lighting.rightIndicator,
         hazard: lighting.hazard
-      });
-      showToast(result as string, false);
-    } catch (e) {
-      showToast(`Błąd: ${e}`, true);
-    } finally {
-      setTimeout(() => {
-        isSendingLighting = false;
-      }, 500);
+      },
+      () => (isSendingLighting = false)
+    );
+  }
+
+  function clearAllPendingTimeouts() {
+    (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
+      if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
+    });
+  }
+
+  function resolvePendingCmd(key: FccuCmdKey, currentState: boolean) {
+    if (!pendingCmds[key]) return;
+    if (expectedStates[key] === undefined || currentState === expectedStates[key]) {
+      if (pendingTimeouts[key]) clearTimeout(pendingTimeouts[key]!);
+      pendingCmds = { ...pendingCmds, [key]: false };
+      delete expectedStates[key];
     }
   }
+
+  function updateChartSeries(
+    chartEl: HTMLElement,
+    samples: TimedSample[],
+    val: number,
+    nowMs: number,
+    xRange: [string, string]
+  ): { samples: TimedSample[]; stats: ChartSeriesStats } {
+    const next = pruneWindowSamples(
+      [...samples, { t: nowMs, v: val }],
+      nowMs,
+      CAN_WINDOW_MS,
+      CAN_MAX_POINTS
+    );
+    Plotly.update(
+      chartEl,
+      { x: [next.map((s) => formatPlotlyTimestamp(s.t))], y: [next.map((s) => s.v)] },
+      { 'xaxis.range': xRange },
+      [0]
+    );
+    const values = next.map((s) => s.v);
+    return {
+      samples: next,
+      stats: { newest: val, average: calcAvg(values), rms: calcRms(values) }
+    };
+  }
+
+  const statRows: { label: string; key: keyof ChartSeriesStats }[] = [
+    { label: 'Bieżąca', key: 'newest' },
+    { label: 'Średnia', key: 'average' },
+    { label: 'Wartość skuteczna', key: 'rms' }
+  ];
+
+  const pidFields: { id: string; key: 'pGain' | 'iGain' | 'dGain'; label: string; helper: string }[] = [
+    { id: 'p-gain-input', key: 'pGain', label: 'Wzmocnienie P', helper: 'Część proporcjonalna' },
+    { id: 'i-gain-input', key: 'iGain', label: 'Wzmocnienie I', helper: 'Część całkująca' },
+    { id: 'd-gain-input', key: 'dGain', label: 'Wzmocnienie D', helper: 'Część różniczkująca' }
+  ];
+
+  const lightingColumns: { key: keyof LightingState; label: string }[][] = [
+    [
+      { key: 'headlight', label: 'Światła główne' },
+      { key: 'brakeLight', label: 'Światło STOP' },
+      { key: 'rightIndicator', label: 'Prawy kierunkowskaz' }
+    ],
+    [
+      { key: 'positionLight', label: 'Światła pozycyjne' },
+      { key: 'leftIndicator', label: 'Lewy kierunkowskaz' },
+      { key: 'hazard', label: 'Światła awaryjne' }
+    ]
+  ];
+
+  $: cmdTiles = [
+    {
+      key: 'system_enable' as FccuCmdKey,
+      name: 'System',
+      stateText: fccuState === 2 ? 'włączony' : 'wyłączony',
+      btnClass: 'btn-blue',
+      active: fccuState === 2,
+      pendingOn: 'Włączanie...',
+      pendingOff: 'Wyłączanie...',
+      labelOn: 'Wyłącz system',
+      labelOff: 'Włącz system'
+    },
+    {
+      key: 'main_valve' as FccuCmdKey,
+      name: 'Zawór główny',
+      stateText: fccuMainValve ? 'otwarty' : 'zamknięty',
+      btnClass: 'btn-grey',
+      active: fccuMainValve,
+      pendingOn: 'Otwieranie...',
+      pendingOff: 'Zamykanie...',
+      labelOn: 'Zamknij zawór główny',
+      labelOff: 'Otwórz zawór główny'
+    },
+    {
+      key: 'manual_purge' as FccuCmdKey,
+      name: 'Przedmuch (purge)',
+      stateText: fccuPurgeValve ? 'aktywny' : 'nieaktywny',
+      btnClass: 'btn-grey',
+      active: fccuPurgeValve,
+      pendingOn: 'Uruchamianie...',
+      pendingOff: 'Zatrzymywanie...',
+      labelOn: 'Zatrzymaj przedmuch',
+      labelOff: 'Uruchom przedmuch'
+    },
+    {
+      key: 'fan_on' as FccuCmdKey,
+      name: 'Wentylator',
+      stateText: fccuFanState ? `włączony (${fccuFanDuty}%)` : 'wyłączony',
+      btnClass: 'btn-grey',
+      active: fccuFanState,
+      pendingOn: 'Włączanie...',
+      pendingOff: 'Wyłączanie...',
+      labelOn: 'Wyłącz wentylator',
+      labelOff: 'Włącz wentylator'
+    }
+  ];
 
   function resetCanData() {
     hasCanData = false;
@@ -265,38 +402,25 @@
     fccuVersion = '—';
     chart1Samples = [];
     chart2Samples = [];
-    canStats = {
-      chart1: { newest: 0, average: 0, rms: 0 },
-      chart2: { newest: 0, average: 0, rms: 0 }
-    };
-    (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
-      if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
-    });
-    pendingCmds = {
-      system_enable: false,
-      main_valve: false,
-      manual_purge: false,
-      fan_on: false
-    };
+    canStats = emptyCanStats();
+    clearAllPendingTimeouts();
+    pendingCmds = idlePendingCmds();
     expectedStates = {};
+  }
+
+  function applyCanStatus(connected: boolean) {
+    canConnected.set(connected);
+    if (!connected) {
+      resetCanData();
+    }
   }
 
   onMount(() => {
     invoke<boolean>('get_can_status')
-      .then((connected) => {
-        canConnected.set(connected);
-        if (!connected) {
-          resetCanData();
-        }
-      })
+      .then(applyCanStatus)
       .catch(() => {});
 
-    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => {
-      canConnected.set(event.payload);
-      if (!event.payload) {
-        resetCanData();
-      }
-    });
+    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => applyCanStatus(event.payload));
 
     if (canChart1 && canChart2) {
       Plotly.newPlot(canChart1, canChartConfigs.chart1.data, canChartConfigs.chart1.layout, plotlyOptions);
@@ -313,97 +437,38 @@
 
       if (d.fccu_state !== undefined) {
         fccuState = d.fccu_state;
-        if (pendingCmds.system_enable) {
-          if (expectedStates.system_enable === undefined || (fccuState === 2) === expectedStates.system_enable) {
-            if (pendingTimeouts.system_enable) clearTimeout(pendingTimeouts.system_enable);
-            pendingCmds = { ...pendingCmds, system_enable: false };
-            delete expectedStates.system_enable;
-          }
-        }
+        resolvePendingCmd('system_enable', fccuState === 2);
       }
-
       if (d.fccu_main_valve !== undefined) {
         fccuMainValve = d.fccu_main_valve;
-        if (pendingCmds.main_valve) {
-          if (expectedStates.main_valve === undefined || fccuMainValve === expectedStates.main_valve) {
-            if (pendingTimeouts.main_valve) clearTimeout(pendingTimeouts.main_valve);
-            pendingCmds = { ...pendingCmds, main_valve: false };
-            delete expectedStates.main_valve;
-          }
-        }
+        resolvePendingCmd('main_valve', fccuMainValve);
       }
-
       if (d.fccu_purge_valve !== undefined) {
         fccuPurgeValve = d.fccu_purge_valve;
-        if (pendingCmds.manual_purge) {
-          if (expectedStates.manual_purge === undefined || fccuPurgeValve === expectedStates.manual_purge) {
-            if (pendingTimeouts.manual_purge) clearTimeout(pendingTimeouts.manual_purge);
-            pendingCmds = { ...pendingCmds, manual_purge: false };
-            delete expectedStates.manual_purge;
-          }
-        }
+        resolvePendingCmd('manual_purge', fccuPurgeValve);
       }
-
       if (d.fccu_fan_state !== undefined) {
         fccuFanState = d.fccu_fan_state;
-        if (pendingCmds.fan_on) {
-          if (expectedStates.fan_on === undefined || fccuFanState === expectedStates.fan_on) {
-            if (pendingTimeouts.fan_on) clearTimeout(pendingTimeouts.fan_on);
-            pendingCmds = { ...pendingCmds, fan_on: false };
-            delete expectedStates.fan_on;
-          }
-        }
+        resolvePendingCmd('fan_on', fccuFanState);
       }
 
       if (d.fccu_fan_duty !== undefined) fccuFanDuty = d.fccu_fan_duty;
       if (d.fccu_version && d.fccu_version.trim().length > 0) fccuVersion = d.fccu_version;
 
       if (canChartsInitialized && canChart1 && canChart2) {
-        const voltage = d.fc_output_voltage ?? 0;
-        const current = d.fc_output_current ?? 0;
-
-        chart1Samples = pruneWindowSamples(
-          [...chart1Samples, { t: nowMs, v: voltage }],
-          nowMs,
-          CAN_WINDOW_MS,
-          CAN_MAX_POINTS
-        );
-        chart2Samples = pruneWindowSamples(
-          [...chart2Samples, { t: nowMs, v: current }],
-          nowMs,
-          CAN_WINDOW_MS,
-          CAN_MAX_POINTS
-        );
-
         const xRange = buildCanXAxisRange(nowMs);
-        Plotly.update(
-          canChart1,
-          { x: [chart1Samples.map((s) => formatPlotlyTimestamp(s.t))], y: [chart1Samples.map((s) => s.v)] },
-          { 'xaxis.range': xRange },
-          [0]
-        );
-        Plotly.update(
-          canChart2,
-          { x: [chart2Samples.map((s) => formatPlotlyTimestamp(s.t))], y: [chart2Samples.map((s) => s.v)] },
-          { 'xaxis.range': xRange },
-          [0]
-        );
-
-        const vValues = chart1Samples.map((s) => s.v);
-        const cValues = chart2Samples.map((s) => s.v);
-        canStats = {
-          chart1: { newest: voltage, average: calcAvg(vValues), rms: calcRms(vValues) },
-          chart2: { newest: current, average: calcAvg(cValues), rms: calcRms(cValues) }
-        };
+        const r1 = updateChartSeries(canChart1, chart1Samples, d.fc_output_voltage ?? 0, nowMs, xRange);
+        const r2 = updateChartSeries(canChart2, chart2Samples, d.fc_output_current ?? 0, nowMs, xRange);
+        chart1Samples = r1.samples;
+        chart2Samples = r2.samples;
+        canStats = { chart1: r1.stats, chart2: r2.stats };
       }
     });
 
     return () => {
       unlistenCan.then((u) => u());
       unlistenCanStatus.then((u) => u());
-      (Object.keys(pendingTimeouts) as FccuCmdKey[]).forEach((k) => {
-        if (pendingTimeouts[k]) clearTimeout(pendingTimeouts[k]!);
-      });
+      clearAllPendingTimeouts();
     };
   });
 </script>
@@ -460,7 +525,7 @@
 
     <div class="top-status-item">
       <span class="status-lbl">Wentylator</span>
-      <span class="status-val bold">{fccuFanState ? 'Włączony' : 'Wyłączony'}</span>
+      <span class="status-val bold">{fccuFanState ? `Włączony (${fccuFanDuty}%)` : 'Wyłączony'}</span>
       <span class="status-sub">
         {fccuSettings.fanMode === 0 ? 'Tryb ręczny' : fccuSettings.fanMode === 1 ? 'Tryb liniowy' : 'Tryb PID'} · {fccuFanDuty ? fccuFanDuty * 30 : 0} obr./min
       </span>
@@ -486,18 +551,12 @@
         <div class="plotly-chart-inner" bind:this={canChart1}></div>
       </div>
       <div class="stats-column">
-        <div class="stat-box">
-          <span class="stat-box-lbl">Bieżąca</span>
-          <span class="stat-box-val">{fmtVal(canStats.chart1.newest)} V</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-box-lbl">Średnia</span>
-          <span class="stat-box-val">{fmtVal(canStats.chart1.average)} V</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-box-lbl">Wartość skuteczna</span>
-          <span class="stat-box-val">{fmtVal(canStats.chart1.rms)} V</span>
-        </div>
+        {#each statRows as row}
+          <div class="stat-box">
+            <span class="stat-box-lbl">{row.label}</span>
+            <span class="stat-box-val">{fmtVal(canStats.chart1[row.key])} V</span>
+          </div>
+        {/each}
       </div>
     </div>
   </div>
@@ -515,18 +574,12 @@
         <div class="plotly-chart-inner" bind:this={canChart2}></div>
       </div>
       <div class="stats-column">
-        <div class="stat-box">
-          <span class="stat-box-lbl">Bieżąca</span>
-          <span class="stat-box-val">{fmtVal(canStats.chart2.newest)} A</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-box-lbl">Średnia</span>
-          <span class="stat-box-val">{fmtVal(canStats.chart2.average)} A</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-box-lbl">Wartość skuteczna</span>
-          <span class="stat-box-val">{fmtVal(canStats.chart2.rms)} A</span>
-        </div>
+        {#each statRows as row}
+          <div class="stat-box">
+            <span class="stat-box-lbl">{row.label}</span>
+            <span class="stat-box-val">{fmtVal(canStats.chart2[row.key])} A</span>
+          </div>
+        {/each}
       </div>
     </div>
   </div>
@@ -536,85 +589,65 @@
       <h3 class="section-card-title">KOMENDY STEROWNIKA FCCU</h3>
     </div>
     <div class="cmd-grid-2x2">
-      <div class="cmd-tile">
-        <div class="cmd-tile-info">
-          <span class="cmd-tile-name">System</span>
-          <span class="cmd-tile-state">Stan: {fccuState === 2 ? 'włączony' : 'wyłączony'}</span>
-        </div>
-        <button
-          class="action-btn btn-blue"
-          class:is-pending={pendingCmds.system_enable}
-          disabled={pendingCmds.system_enable}
-          on:click={() => toggleFccuCmd('system_enable')}
-        >
-          {#if pendingCmds.system_enable}
-            <span class="btn-spinner"></span>
-            <span>{expectedStates.system_enable ? 'Włączanie...' : 'Wyłączanie...'}</span>
-          {:else}
-            {fccuState === 2 ? 'Wyłącz system' : 'Włącz system'}
-          {/if}
-        </button>
-      </div>
+      {#each cmdTiles as tile}
+        <div class="cmd-tile" class:cmd-tile-fan={tile.key === 'fan_on'}>
+          <div class="cmd-tile-main">
+            <div class="cmd-tile-info">
+              <span class="cmd-tile-name">{tile.name}</span>
+              <span class="cmd-tile-state">Stan: {tile.stateText}</span>
+            </div>
+            <button
+              class="action-btn {tile.btnClass}"
+              class:is-pending={pendingCmds[tile.key]}
+              disabled={pendingCmds[tile.key]}
+              on:click={() => toggleFccuCmd(tile.key)}
+            >
+              {#if pendingCmds[tile.key]}
+                <span class="btn-spinner"></span>
+                <span>{expectedStates[tile.key] ? tile.pendingOn : tile.pendingOff}</span>
+              {:else}
+                {tile.active ? tile.labelOn : tile.labelOff}
+              {/if}
+            </button>
+          </div>
 
-      <div class="cmd-tile">
-        <div class="cmd-tile-info">
-          <span class="cmd-tile-name">Zawór główny</span>
-          <span class="cmd-tile-state">Stan: {fccuMainValve ? 'otwarty' : 'zamknięty'}</span>
-        </div>
-        <button
-          class="action-btn btn-grey"
-          class:is-pending={pendingCmds.main_valve}
-          disabled={pendingCmds.main_valve}
-          on:click={() => toggleFccuCmd('main_valve')}
-        >
-          {#if pendingCmds.main_valve}
-            <span class="btn-spinner"></span>
-            <span>{expectedStates.main_valve ? 'Otwieranie...' : 'Zamykanie...'}</span>
-          {:else}
-            {fccuMainValve ? 'Zamknij zawór główny' : 'Otwórz zawór główny'}
+          {#if tile.key === 'fan_on'}
+            <div class="fan-duty-row">
+              <label for="fan-duty-number" class="fan-duty-lbl">Wysterowanie (%)</label>
+              <input
+                type="range"
+                class="fan-duty-slider"
+                min="0"
+                max="100"
+                step="1"
+                bind:value={fanDutyCmd}
+                aria-label="Wypełnienie wentylatora w procentach"
+              />
+              <div class="input-unit-wrapper fan-duty-number-wrap">
+                <input
+                  id="fan-duty-number"
+                  type="number"
+                  class="setting-form-input fan-duty-number"
+                  min="0"
+                  max="100"
+                  bind:value={fanDutyCmd}
+                  on:change={() => (fanDutyCmd = clampFanDuty(fanDutyCmd))}
+                  on:keydown={(e) => e.key === 'Enter' && sendFanDuty()}
+                />
+                <span class="input-unit-badge">%</span>
+              </div>
+              <button
+                type="button"
+                class="action-btn btn-blue fan-duty-btn"
+                disabled={isSendingFanDuty}
+                on:click={sendFanDuty}
+              >
+                {isSendingFanDuty ? 'Wysyłanie...' : 'Ustaw'}
+              </button>
+            </div>
           {/if}
-        </button>
-      </div>
-
-      <div class="cmd-tile">
-        <div class="cmd-tile-info">
-          <span class="cmd-tile-name">Przedmuch (purge)</span>
-          <span class="cmd-tile-state">Stan: {fccuPurgeValve ? 'aktywny' : 'nieaktywny'}</span>
         </div>
-        <button
-          class="action-btn btn-grey"
-          class:is-pending={pendingCmds.manual_purge}
-          disabled={pendingCmds.manual_purge}
-          on:click={() => toggleFccuCmd('manual_purge')}
-        >
-          {#if pendingCmds.manual_purge}
-            <span class="btn-spinner"></span>
-            <span>{expectedStates.manual_purge ? 'Uruchamianie...' : 'Zatrzymywanie...'}</span>
-          {:else}
-            {fccuPurgeValve ? 'Zatrzymaj przedmuch' : 'Uruchom przedmuch'}
-          {/if}
-        </button>
-      </div>
-
-      <div class="cmd-tile">
-        <div class="cmd-tile-info">
-          <span class="cmd-tile-name">Wentylator</span>
-          <span class="cmd-tile-state">Stan: {fccuFanState ? 'włączony' : 'wyłączony'}</span>
-        </div>
-        <button
-          class="action-btn btn-grey"
-          class:is-pending={pendingCmds.fan_on}
-          disabled={pendingCmds.fan_on}
-          on:click={() => toggleFccuCmd('fan_on')}
-        >
-          {#if pendingCmds.fan_on}
-            <span class="btn-spinner"></span>
-            <span>{expectedStates.fan_on ? 'Włączanie...' : 'Wyłączanie...'}</span>
-          {:else}
-            {fccuFanState ? 'Wyłącz wentylator' : 'Włącz wentylator'}
-          {/if}
-        </button>
-      </div>
+      {/each}
     </div>
   </div>
 
@@ -644,47 +677,21 @@
           <span class="setting-form-helper">Czas między cyklami purge</span>
         </div>
 
-        <div class="setting-form-row" class:disabled={!isPidEnabled}>
-          <label for="p-gain-input" class="setting-form-label">Wzmocnienie P</label>
-          <input
-            id="p-gain-input"
-            type="number"
-            class="setting-form-input"
-            bind:value={fccuSettings.pGain}
-            min="0"
-            max="1000"
-            disabled={!isPidEnabled}
-          />
-          <span class="setting-form-helper">Część proporcjonalna</span>
-        </div>
-
-        <div class="setting-form-row" class:disabled={!isPidEnabled}>
-          <label for="i-gain-input" class="setting-form-label">Wzmocnienie I</label>
-          <input
-            id="i-gain-input"
-            type="number"
-            class="setting-form-input"
-            bind:value={fccuSettings.iGain}
-            min="0"
-            max="1000"
-            disabled={!isPidEnabled}
-          />
-          <span class="setting-form-helper">Część całkująca</span>
-        </div>
-
-        <div class="setting-form-row" class:disabled={!isPidEnabled}>
-          <label for="d-gain-input" class="setting-form-label">Wzmocnienie D</label>
-          <input
-            id="d-gain-input"
-            type="number"
-            class="setting-form-input"
-            bind:value={fccuSettings.dGain}
-            min="0"
-            max="1000"
-            disabled={!isPidEnabled}
-          />
-          <span class="setting-form-helper">Część różniczkująca</span>
-        </div>
+        {#each pidFields as field}
+          <div class="setting-form-row" class:disabled={!isPidEnabled}>
+            <label for={field.id} class="setting-form-label">{field.label}</label>
+            <input
+              id={field.id}
+              type="number"
+              class="setting-form-input"
+              bind:value={fccuSettings[field.key]}
+              min="0"
+              max="1000"
+              disabled={!isPidEnabled}
+            />
+            <span class="setting-form-helper">{field.helper}</span>
+          </div>
+        {/each}
       </div>
 
       <div class="settings-readout-column">
@@ -699,6 +706,10 @@
             <span class="fan-readout-val">
               {fccuSettings.fanMode === 0 ? 'Ręczny' : fccuSettings.fanMode === 1 ? 'Liniowy' : 'Regulator PID'}
             </span>
+          </div>
+          <div class="fan-readout-item">
+            <span class="fan-readout-key">Wypełnienie</span>
+            <span class="fan-readout-val">{fccuFanDuty} %</span>
           </div>
           <div class="fan-readout-item">
             <span class="fan-readout-key">Prędkość</span>
@@ -718,63 +729,20 @@
     </div>
 
     <div class="lighting-grid-layout">
-      <div class="lighting-column">
-        <div class="light-switch-row">
-          <label class="switch-container">
-            <input type="checkbox" bind:checked={lighting.headlight} />
-            <span class="switch-track"></span>
-            <span class="switch-label-text">Światła główne</span>
-          </label>
-          <span class="switch-status-text">{lighting.headlight ? 'Włączone' : 'Wyłączone'}</span>
+      {#each lightingColumns as col}
+        <div class="lighting-column">
+          {#each col as item}
+            <div class="light-switch-row">
+              <label class="switch-container">
+                <input type="checkbox" bind:checked={lighting[item.key]} />
+                <span class="switch-track"></span>
+                <span class="switch-label-text">{item.label}</span>
+              </label>
+              <span class="switch-status-text">{lighting[item.key] ? 'Włączone' : 'Wyłączone'}</span>
+            </div>
+          {/each}
         </div>
-
-        <div class="light-switch-row">
-          <label class="switch-container">
-            <input type="checkbox" bind:checked={lighting.brakeLight} />
-            <span class="switch-track"></span>
-            <span class="switch-label-text">Światło STOP</span>
-          </label>
-          <span class="switch-status-text">{lighting.brakeLight ? 'Włączone' : 'Wyłączone'}</span>
-        </div>
-
-        <div class="light-switch-row">
-          <label class="switch-container">
-            <input type="checkbox" bind:checked={lighting.rightIndicator} />
-            <span class="switch-track"></span>
-            <span class="switch-label-text">Prawy kierunkowskaz</span>
-          </label>
-          <span class="switch-status-text">{lighting.rightIndicator ? 'Włączone' : 'Wyłączone'}</span>
-        </div>
-      </div>
-
-      <div class="lighting-column">
-        <div class="light-switch-row">
-          <label class="switch-container">
-            <input type="checkbox" bind:checked={lighting.positionLight} />
-            <span class="switch-track"></span>
-            <span class="switch-label-text">Światła pozycyjne</span>
-          </label>
-          <span class="switch-status-text">{lighting.positionLight ? 'Włączone' : 'Wyłączone'}</span>
-        </div>
-
-        <div class="light-switch-row">
-          <label class="switch-container">
-            <input type="checkbox" bind:checked={lighting.leftIndicator} />
-            <span class="switch-track"></span>
-            <span class="switch-label-text">Lewy kierunkowskaz</span>
-          </label>
-          <span class="switch-status-text">{lighting.leftIndicator ? 'Włączone' : 'Wyłączone'}</span>
-        </div>
-
-        <div class="light-switch-row">
-          <label class="switch-container">
-            <input type="checkbox" bind:checked={lighting.hazard} />
-            <span class="switch-track"></span>
-            <span class="switch-label-text">Światła awaryjne</span>
-          </label>
-          <span class="switch-status-text">{lighting.hazard ? 'Włączone' : 'Wyłączone'}</span>
-        </div>
-      </div>
+      {/each}
     </div>
 
     <div class="lighting-action-row">
@@ -1093,8 +1061,52 @@
     border-radius: 8px;
     padding: 10px 14px;
     display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
+  }
+
+  .cmd-tile-main {
+    display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 12px;
+  }
+
+  .fan-duty-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-top: 10px;
+    border-top: 1px solid #27272a;
+  }
+
+  .fan-duty-lbl {
+    font-size: 0.75rem;
+    color: #a1a1aa;
+    white-space: nowrap;
+  }
+
+  .fan-duty-slider {
+    flex: 1;
+    min-width: 60px;
+    accent-color: #3b82f6;
+    cursor: pointer;
+  }
+
+  .fan-duty-number-wrap {
+    width: 78px;
+    flex-shrink: 0;
+  }
+
+  .fan-duty-number {
+    padding: 6px 24px 6px 8px;
+    font-size: 0.82rem;
+  }
+
+  .fan-duty-btn {
+    border: none;
+    padding: 7px 14px;
   }
 
   .cmd-tile-info {

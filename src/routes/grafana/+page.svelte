@@ -150,7 +150,10 @@
   <div class="db-config-header">
     <div class="db-config-header-left">
       <span class="db-config-title">Konfiguracja połączenia z bazą (PostgreSQL)</span>
-      <div class="db-status-badge {$dbStatus.connected ? 'status-connected' : 'status-disconnected'}">
+      <div
+        class="db-status-badge {$dbStatus.connected ? 'status-connected' : 'status-disconnected'}"
+        title={$dbStatus.message}
+      >
         <span class="status-dot"></span>
         <span class="status-text">{$dbStatus.connected ? 'Połączono' : 'Rozłączono'}: {$dbStatus.message}</span>
       </div>

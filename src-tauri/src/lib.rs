@@ -74,7 +74,21 @@ pub struct CanReadData {
 
 // ── Shared PCAN state ──
 
-pub struct CanState(pub Arc<RwLock<Option<Arc<PcanDriver>>>>);
+pub type PcanHolder = Arc<RwLock<Option<Arc<PcanDriver>>>>;
+
+pub struct CanState(pub PcanHolder);
+
+impl CanState {
+    fn driver(&self) -> Option<Arc<PcanDriver>> {
+        self.0.read().ok().and_then(|guard| guard.clone())
+    }
+}
+
+fn set_driver(holder: &PcanHolder, driver: Option<Arc<PcanDriver>>) {
+    if let Ok(mut guard) = holder.write() {
+        *guard = driver;
+    }
+}
 
 // ── PostgreSQL configuration & state ──
 
@@ -133,15 +147,17 @@ pub fn load_db_config_from_path(path: &std::path::Path) -> DbConfig {
 
 fn load_initial_db_config() -> DbConfig {
     dotenvy::dotenv().ok();
+    let defaults = DbConfig::default();
+    let env_or = |key: &str, default: String| std::env::var(key).unwrap_or(default);
     DbConfig {
-        host: std::env::var("PG_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        host: env_or("PG_HOST", defaults.host),
         port: std::env::var("PG_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(5432),
-        user: std::env::var("PG_USER").unwrap_or_else(|_| "postgres".to_string()),
-        password: std::env::var("PG_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
-        dbname: std::env::var("PG_DBNAME").unwrap_or_else(|_| "engine_db".to_string()),
+            .unwrap_or(defaults.port),
+        user: env_or("PG_USER", defaults.user),
+        password: env_or("PG_PASSWORD", defaults.password),
+        dbname: env_or("PG_DBNAME", defaults.dbname),
     }
 }
 
@@ -160,12 +176,8 @@ fn save_db_config_to_env(config: &DbConfig) -> Result<(), String> {
     std::env::set_var("PG_PASSWORD", &config.password);
     std::env::set_var("PG_DBNAME", &config.dbname);
 
-    let paths = [
-        std::path::PathBuf::from(".env"),
-        std::path::PathBuf::from("../.env"),
-    ];
     let mut written = false;
-    for p in &paths {
+    for p in [".env", "../.env"].map(std::path::Path::new) {
         if p.exists() && save_db_config_to_path(config, p).is_ok() {
             written = true;
         }
@@ -178,6 +190,43 @@ fn save_db_config_to_env(config: &DbConfig) -> Result<(), String> {
 
 // ── PostgreSQL stream (Grafana tab) ──
 
+fn update_db_status(
+    app_handle: &AppHandle,
+    status_arc: &Arc<RwLock<DbStatus>>,
+    connected: bool,
+    message: String,
+) {
+    let status = DbStatus { connected, message };
+    if let Ok(mut s) = status_arc.write() {
+        *s = status.clone();
+    }
+    let _ = app_handle.emit("db-connection-status", status);
+}
+
+fn format_pg_error(e: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = e.as_db_error() {
+        return match db_err.detail() {
+            Some(detail) => format!("{} ({})", db_err.message(), detail),
+            None => db_err.message().to_string(),
+        };
+    }
+    if let Some(source) = std::error::Error::source(e) {
+        return format!("{}: {}", e, source);
+    }
+    e.to_string()
+}
+
+fn build_pg_config(cfg: &DbConfig) -> tokio_postgres::Config {
+    let mut pg_cfg = tokio_postgres::Config::new();
+    pg_cfg
+        .host(cfg.host.trim())
+        .port(cfg.port)
+        .user(cfg.user.trim())
+        .password(&cfg.password)
+        .dbname(cfg.dbname.trim());
+    pg_cfg
+}
+
 fn start_pg_stream(
     app_handle: AppHandle,
     mut config_rx: tokio::sync::watch::Receiver<DbConfig>,
@@ -186,23 +235,14 @@ fn start_pg_stream(
     tauri::async_runtime::spawn(async move {
         loop {
             let current_config = config_rx.borrow_and_update().clone();
-            let conn_string = format!(
-                "host={} port={} user={} password={} dbname={}",
-                current_config.host,
-                current_config.port,
-                current_config.user,
-                current_config.password,
-                current_config.dbname
-            );
+            let pg_config = build_pg_config(&current_config);
 
-            let status_connecting = DbStatus {
-                connected: false,
-                message: format!("Łączenie z {}:{}...", current_config.host, current_config.port),
-            };
-            if let Ok(mut s) = status_arc.write() {
-                *s = status_connecting.clone();
-            }
-            let _ = app_handle.emit("db-connection-status", status_connecting);
+            update_db_status(
+                &app_handle,
+                &status_arc,
+                false,
+                format!("Łączenie z {}:{}...", current_config.host, current_config.port),
+            );
 
             println!(
                 "Łączenie z PostgreSQL: host={} port={} user={} dbname={}",
@@ -210,7 +250,7 @@ fn start_pg_stream(
             );
 
             let connect_result = tokio::select! {
-                res = tokio_postgres::connect(&conn_string, NoTls) => Some(res),
+                res = pg_config.connect(NoTls) => Some(res),
                 _ = config_rx.changed() => None,
             };
 
@@ -222,27 +262,23 @@ fn start_pg_stream(
                         }
                     });
                     println!("Połączono z PostgreSQL/TimescaleDB!");
-                    let status_ok = DbStatus {
-                        connected: true,
-                        message: format!("Połączono ({})", current_config.dbname),
-                    };
-                    if let Ok(mut s) = status_arc.write() {
-                        *s = status_ok.clone();
-                    }
-                    let _ = app_handle.emit("db-connection-status", status_ok);
+                    update_db_status(
+                        &app_handle,
+                        &status_arc,
+                        true,
+                        format!("Połączono ({})", current_config.dbname),
+                    );
                     client
                 }
                 Some(Err(e)) => {
-                    let err_msg = format!("Błąd połączenia: {}", e);
-                    eprintln!("Błąd połączenia z PostgreSQL: {}. Ponowna próba za 3s...", e);
-                    let status_err = DbStatus {
-                        connected: false,
-                        message: err_msg,
-                    };
-                    if let Ok(mut s) = status_arc.write() {
-                        *s = status_err.clone();
-                    }
-                    let _ = app_handle.emit("db-connection-status", status_err);
+                    let details = format_pg_error(&e);
+                    eprintln!("Błąd połączenia z PostgreSQL: {}. Ponowna próba za 3s...", details);
+                    update_db_status(
+                        &app_handle,
+                        &status_arc,
+                        false,
+                        format!("Błąd połączenia: {}", details),
+                    );
 
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(3)) => {}
@@ -250,9 +286,7 @@ fn start_pg_stream(
                     }
                     continue;
                 }
-                None => {
-                    continue;
-                }
+                None => continue,
             };
 
             let mut is_connected = true;
@@ -276,33 +310,33 @@ fn start_pg_stream(
 
                         match result {
                             Ok(Some(row)) => {
+                                let get_f64 = |col: &str| row.get::<_, Option<f64>>(col).unwrap_or(0.0);
                                 let data = EngineData {
-                                    voltage1: row.get::<_, Option<f64>>("voltage1").unwrap_or(0.0),
-                                    voltage2: row.get::<_, Option<f64>>("voltage2").unwrap_or(0.0),
-                                    voltage3: row.get::<_, Option<f64>>("voltage3").unwrap_or(0.0),
-                                    current1: row.get::<_, Option<f64>>("current1").unwrap_or(0.0),
-                                    current2: row.get::<_, Option<f64>>("current2").unwrap_or(0.0),
-                                    current3: row.get::<_, Option<f64>>("current3").unwrap_or(0.0),
-                                    power1: row.get::<_, Option<f64>>("power1").unwrap_or(0.0),
-                                    power2: row.get::<_, Option<f64>>("power2").unwrap_or(0.0),
-                                    power3: row.get::<_, Option<f64>>("power3").unwrap_or(0.0),
-                                    temperature: row.get::<_, Option<f64>>("temperature").unwrap_or(0.0),
-                                    rpm: row.get::<_, Option<f64>>("rpm").unwrap_or(0.0),
+                                    voltage1: get_f64("voltage1"),
+                                    voltage2: get_f64("voltage2"),
+                                    voltage3: get_f64("voltage3"),
+                                    current1: get_f64("current1"),
+                                    current2: get_f64("current2"),
+                                    current3: get_f64("current3"),
+                                    power1: get_f64("power1"),
+                                    power2: get_f64("power2"),
+                                    power3: get_f64("power3"),
+                                    temperature: get_f64("temperature"),
+                                    rpm: get_f64("rpm"),
                                 };
 
                                 let _ = app_handle.emit("engine-data-update", data);
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                eprintln!("PostgreSQL query error: {:?}", e);
-                                let status_err = DbStatus {
-                                    connected: false,
-                                    message: format!("Błąd zapytania: {}", e),
-                                };
-                                if let Ok(mut s) = status_arc.write() {
-                                    *s = status_err.clone();
-                                }
-                                let _ = app_handle.emit("db-connection-status", status_err);
+                                let details = format_pg_error(&e);
+                                eprintln!("PostgreSQL query error: {}", details);
+                                update_db_status(
+                                    &app_handle,
+                                    &status_arc,
+                                    false,
+                                    format!("Błąd zapytania: {}", details),
+                                );
                                 is_connected = false;
                             }
                         }
@@ -320,12 +354,12 @@ pub fn create_dbc_parser() -> can_decode::Parser {
     let mut parser = can_decode::Parser::new();
     let loaded = if let Ok(path) = std::env::var("DBC_FILE_PATH") {
         parser.add_from_dbc_file(std::path::Path::new(&path)).is_ok()
-    } else if std::path::Path::new("can/vehicle.dbc").exists() {
-        parser.add_from_dbc_file(std::path::Path::new("can/vehicle.dbc")).is_ok()
-    } else if std::path::Path::new("src-tauri/can/vehicle.dbc").exists() {
-        parser.add_from_dbc_file(std::path::Path::new("src-tauri/can/vehicle.dbc")).is_ok()
     } else {
-        false
+        ["can/vehicle.dbc", "src-tauri/can/vehicle.dbc"]
+            .map(std::path::Path::new)
+            .into_iter()
+            .find(|p| p.exists())
+            .is_some_and(|p| parser.add_from_dbc_file(p).is_ok())
     };
 
     if !loaded {
@@ -361,126 +395,86 @@ pub fn decode_can_frame(
     buf[..len].copy_from_slice(&payload[..len]);
 
     // Check with standard ID, or extended ID (bit 31 set as per DBC extended ID convention)
-    let decoded_msg = parser
+    let Some(msg) = parser
         .decode_msg(id, &buf)
-        .or_else(|| parser.decode_msg(id | (1 << 31), &buf));
-
-    let Some(msg) = decoded_msg else {
+        .or_else(|| parser.decode_msg(id | (1 << 31), &buf))
+    else {
         return;
     };
 
+    macro_rules! set_phys {
+        ($sig:expr, $target:expr) => {
+            if let Some(s) = msg.signals.get($sig) {
+                $target = s.value.physical;
+            }
+        };
+    }
+    macro_rules! set_bool {
+        ($sig:expr, $target:expr) => {
+            if let Some(s) = msg.signals.get($sig) {
+                $target = s.value.physical > 0.0;
+            }
+        };
+    }
+    macro_rules! set_u8 {
+        ($sig:expr, $target:expr) => {
+            if let Some(s) = msg.signals.get($sig) {
+                $target = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
+            }
+        };
+    }
+
     match msg.name.as_str() {
         "MCU_STATE" => {
-            if let Some(s) = msg.signals.get("STATUS") {
-                data.mcu_status = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
-            }
-            if let Some(s) = msg.signals.get("VEHICLE_TYPE") {
-                data.vehicle_type = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
-            }
-            if let Some(s) = msg.signals.get("MOTOR_CONTROLLER_ENABLED") {
-                data.motor_controller_enabled = s.value.physical > 0.0;
-            }
-            if let Some(s) = msg.signals.get("MAIN_VALVE_ENABLED") {
-                data.main_valve_enabled = s.value.physical > 0.0;
-            }
+            set_u8!("STATUS", data.mcu_status);
+            set_u8!("VEHICLE_TYPE", data.vehicle_type);
+            set_bool!("MOTOR_CONTROLLER_ENABLED", data.motor_controller_enabled);
+            set_bool!("MAIN_VALVE_ENABLED", data.main_valve_enabled);
         }
         "MCU_ANALOG_FUEL_CELL" => {
-            if let Some(s) = msg.signals.get("FUEL_CELL_OUTPUT_CURRENT") {
-                data.fc_output_current = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("FUEL_CELL_OUTPUT_VOLTAGE") {
-                data.fc_output_voltage = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("HYDROGEN_HIGH_PRESSURE") {
-                data.h2_high_pressure = s.value.physical;
-            }
+            set_phys!("FUEL_CELL_OUTPUT_CURRENT", data.fc_output_current);
+            set_phys!("FUEL_CELL_OUTPUT_VOLTAGE", data.fc_output_voltage);
+            set_phys!("HYDROGEN_HIGH_PRESSURE", data.h2_high_pressure);
         }
         "MCU_ANALOG_POWERTRAIN" => {
-            if let Some(s) = msg.signals.get("SUPERCAPACITOR_VOLTAGE") {
-                data.sc_voltage = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("SUPERCAPACITOR_CURRENT") {
-                data.sc_current = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("MOTOR_CONTROLLER_SUPPLY_CURRENT") {
-                data.mc_supply_current = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("MOTOR_CONTROLLER_SUPPLY_VOLTAGE") {
-                data.mc_supply_voltage = s.value.physical;
-            }
+            set_phys!("SUPERCAPACITOR_VOLTAGE", data.sc_voltage);
+            set_phys!("SUPERCAPACITOR_CURRENT", data.sc_current);
+            set_phys!("MOTOR_CONTROLLER_SUPPLY_CURRENT", data.mc_supply_current);
+            set_phys!("MOTOR_CONTROLLER_SUPPLY_VOLTAGE", data.mc_supply_voltage);
         }
         "MCU_ANALOG_ACCESSORY" => {
-            if let Some(s) = msg.signals.get("ACCESSORY_BATTERY_CURRENT") {
-                data.ab_current = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("ACCESSORY_BATTERY_VOLTAGE") {
-                data.ab_voltage = s.value.physical;
-            }
+            set_phys!("ACCESSORY_BATTERY_CURRENT", data.ab_current);
+            set_phys!("ACCESSORY_BATTERY_VOLTAGE", data.ab_voltage);
         }
         "MCU_ANALOG_DRIVE" => {
-            if let Some(s) = msg.signals.get("RPM") {
-                data.rpm = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("SPEED") {
-                data.speed = s.value.physical;
-            }
+            set_phys!("RPM", data.rpm);
+            set_phys!("SPEED", data.speed);
         }
         "PROTIUM_POWER" => {
-            if let Some(s) = msg.signals.get("FC_V") {
-                data.fc_output_voltage = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("FC_A") {
-                data.fc_output_current = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("FC_W") {
-                data.fc_w = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("ENERGY") {
-                data.energy_wh = s.value.physical;
-            }
+            set_phys!("FC_V", data.fc_output_voltage);
+            set_phys!("FC_A", data.fc_output_current);
+            set_phys!("FC_W", data.fc_w);
+            set_phys!("ENERGY", data.energy_wh);
         }
         "FCCU_STATE" => {
-            if let Some(s) = msg.signals.get("STATE") {
-                data.fccu_state = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
-            }
-            if let Some(s) = msg.signals.get("MAIN_VALVE") {
-                data.fccu_main_valve = s.value.physical > 0.0;
-            }
-            if let Some(s) = msg.signals.get("PURGE_VALVE") {
-                data.fccu_purge_valve = s.value.physical > 0.0;
-            }
-            if let Some(s) = msg.signals.get("FAN_STATE") {
-                data.fccu_fan_state = s.value.physical > 0.0;
-            }
-            if let Some(s) = msg.signals.get("FAN_DUTY") {
-                data.fccu_fan_duty = s.value.raw.unwrap_or(s.value.physical as i128) as u8;
-            }
+            set_u8!("STATE", data.fccu_state);
+            set_bool!("MAIN_VALVE", data.fccu_main_valve);
+            set_bool!("PURGE_VALVE", data.fccu_purge_valve);
+            set_bool!("FAN_STATE", data.fccu_fan_state);
+            set_u8!("FAN_DUTY", data.fccu_fan_duty);
         }
         "FCCU_VERSION" => {
-            let major = msg
-                .signals
-                .get("FIRMWARE_MAJOR")
-                .map(|s| s.value.physical as u8)
-                .unwrap_or(0);
-            let minor = msg
-                .signals
-                .get("FIRMWARE_MINOR")
-                .map(|s| s.value.physical as u8)
-                .unwrap_or(0);
-            let patch = msg
-                .signals
-                .get("FIRMWARE_PATCH")
-                .map(|s| s.value.physical as u8)
-                .unwrap_or(0);
-            data.fccu_version = format!("v{}.{}.{}", major, minor, patch);
+            let ver = |k: &str| msg.signals.get(k).map_or(0, |s| s.value.physical as u8);
+            data.fccu_version = format!(
+                "v{}.{}.{}",
+                ver("FIRMWARE_MAJOR"),
+                ver("FIRMWARE_MINOR"),
+                ver("FIRMWARE_PATCH")
+            );
         }
         "FCCU_HYDROGEN" => {
-            if let Some(s) = msg.signals.get("H2_FLOW") {
-                data.h2_flow = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("H2_LP_PRESSURE") {
-                data.h2_lp_pressure = s.value.physical;
-            }
+            set_phys!("H2_FLOW", data.h2_flow);
+            set_phys!("H2_LP_PRESSURE", data.h2_lp_pressure);
         }
         "FCCU_POWER" => {
             if let Some(s) = msg.signals.get("FC_VOLTAGE") {
@@ -492,23 +486,13 @@ pub fn decode_can_frame(
                 data.fc_output_current = s.value.physical;
             }
             data.fc_w = data.fc_output_voltage * data.fc_output_current;
-            if let Some(s) = msg.signals.get("DCDC_VOLTAGE") {
-                data.fccu_dcdc_voltage = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("DCDC_CURRENT") {
-                data.fccu_dcdc_current = s.value.physical;
-            }
+            set_phys!("DCDC_VOLTAGE", data.fccu_dcdc_voltage);
+            set_phys!("DCDC_CURRENT", data.fccu_dcdc_current);
         }
         "FCCU_ENVIRONMENT" => {
-            if let Some(s) = msg.signals.get("FC_TEMP_C") {
-                data.fc_temp = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("AMBIENT_TEMP_C") {
-                data.ambient_temp = s.value.physical;
-            }
-            if let Some(s) = msg.signals.get("AMBIENT_HUMIDITY") {
-                data.ambient_humidity = s.value.physical;
-            }
+            set_phys!("FC_TEMP_C", data.fc_temp);
+            set_phys!("AMBIENT_TEMP_C", data.ambient_temp);
+            set_phys!("AMBIENT_HUMIDITY", data.ambient_humidity);
         }
         _ => {}
     }
@@ -519,18 +503,13 @@ pub fn decode_can_frame(
 /// Parses PCAN channel specification (e.g. "1" -> 0x51, "0x52" -> 0x52).
 pub fn parse_pcan_channel(v: &str) -> Option<u16> {
     let trimmed = v.trim();
-    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        u16::from_str_radix(&trimmed[2..], 16).ok()
-    } else if let Ok(num) = trimmed.parse::<u16>() {
-        if num == 0 {
-            None
-        } else if num < 0x50 {
-            Some(0x50 + num) // e.g. "1" -> 0x51, "2" -> 0x52
-        } else {
-            Some(num)
-        }
-    } else {
-        None
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        return u16::from_str_radix(hex, 16).ok();
+    }
+    match trimmed.parse::<u16>().ok()? {
+        0 => None,
+        num if num < 0x50 => Some(0x50 + num), // e.g. "1" -> 0x51, "2" -> 0x52
+        num => Some(num),
     }
 }
 
@@ -540,7 +519,25 @@ fn get_preferred_pcan_channel() -> Option<u16> {
         .and_then(|v| parse_pcan_channel(&v))
 }
 
-fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<PcanDriver>>>>) {
+fn set_can_connected(app_handle: &AppHandle, was_connected: &mut bool, connected: bool) {
+    if *was_connected != connected {
+        let _ = app_handle.emit("can-connection-status", connected);
+        *was_connected = connected;
+    }
+}
+
+fn disconnect_can(
+    app_handle: &AppHandle,
+    pcan_holder: &PcanHolder,
+    was_connected: &mut bool,
+    accumulated: &mut CanReadData,
+) {
+    set_driver(pcan_holder, None);
+    set_can_connected(app_handle, was_connected, false);
+    *accumulated = CanReadData::default();
+}
+
+fn start_can_stream(app_handle: AppHandle, pcan_holder: PcanHolder) {
     tauri::async_runtime::spawn(async move {
         println!("[CAN] Pętla obsługi magistrali CAN uruchomiona (ciągłe nasłuchiwanie / auto-reconnect)");
 
@@ -549,22 +546,13 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
         let mut was_connected = false;
 
         loop {
-            let driver_opt = {
-                pcan_holder.read().ok().and_then(|guard| guard.clone())
-            };
+            let driver_opt = pcan_holder.read().ok().and_then(|guard| guard.clone());
 
             let driver = match driver_opt {
                 Some(d) => {
                     if !d.is_hardware_ok() {
                         eprintln!("[CAN] Wykryto fizyczne odłączenie adaptera PCAN-USB (sprawdzenie sprzętowe)");
-                        if let Ok(mut guard) = pcan_holder.write() {
-                            *guard = None;
-                        }
-                        if was_connected {
-                            let _ = app_handle.emit("can-connection-status", false);
-                            was_connected = false;
-                        }
-                        accumulated = CanReadData::default();
+                        disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated);
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
@@ -572,27 +560,20 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
                 }
                 None => {
                     // Brak adaptera — ciągłe nasłuchiwanie USB w tle (auto-reconnect)
-                    let preferred_channel = get_preferred_pcan_channel();
-                    match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
+                    match PcanDriver::new_auto(get_preferred_pcan_channel(), PCAN_BAUD_500K) {
                         Ok(new_driver) => {
-                            let ch = new_driver.channel();
                             println!(
                                 "[CAN] Automatycznie wykryto i połączono adapter PCAN-USB (kanał 0x{:02X})!",
-                                ch
+                                new_driver.channel()
                             );
                             let arc_driver = Arc::new(new_driver);
-                            if let Ok(mut guard) = pcan_holder.write() {
-                                *guard = Some(arc_driver.clone());
-                            }
+                            set_driver(&pcan_holder, Some(arc_driver.clone()));
                             let _ = app_handle.emit("can-connection-status", true);
                             was_connected = true;
                             arc_driver
                         }
                         Err(_) => {
-                            if was_connected {
-                                let _ = app_handle.emit("can-connection-status", false);
-                                was_connected = false;
-                            }
+                            set_can_connected(&app_handle, &mut was_connected, false);
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
                         }
@@ -600,10 +581,7 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
                 }
             };
 
-            if !was_connected {
-                let _ = app_handle.emit("can-connection-status", true);
-                was_connected = true;
-            }
+            set_can_connected(&app_handle, &mut was_connected, true);
 
             let mut frames_read = 0u32;
             let mut hardware_lost = false;
@@ -612,12 +590,7 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
                     Ok(Some(msg)) => {
                         let can_id = msg.id & 0x1FFFFFFF; // mask to 29-bit
                         let len = (msg.len as usize).min(msg.data.len());
-                        decode_can_frame(
-                            &parser,
-                            &mut accumulated,
-                            can_id,
-                            &msg.data[..len],
-                        );
+                        decode_can_frame(&parser, &mut accumulated, can_id, &msg.data[..len]);
                         frames_read += 1;
                         if frames_read >= 500 {
                             break;
@@ -637,12 +610,7 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: Arc<RwLock<Option<Arc<Pc
             }
 
             if hardware_lost {
-                if let Ok(mut guard) = pcan_holder.write() {
-                    *guard = None;
-                }
-                let _ = app_handle.emit("can-connection-status", false);
-                was_connected = false;
-                accumulated = CanReadData::default();
+                disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated);
                 tokio::time::sleep(Duration::from_millis(500)).await;
             } else {
                 let _ = app_handle.emit("can-data-update", accumulated.clone());
@@ -669,6 +637,11 @@ pub fn encode_fccu_command(
     Ok((can_id, name, [state as u8]))
 }
 
+/// Encodes `FCCU_FAN (0x513)` 2-byte frame (`CMD_FAN_ON` at bit 0, `CMD_FAN_DUTY` 0..=100% at byte 1).
+pub fn encode_fccu_fan(state: bool, duty: u8) -> (u32, &'static str, [u8; 2]) {
+    (0x513, "FCCU_FAN", [state as u8, duty.min(100)])
+}
+
 /// Encodes FCCU fan & purge valve settings into `(FCCU_FAN_SETTINGS 0x520, FCCU_VALVE_SETTINGS 0x521)` payloads.
 pub fn encode_fccu_settings(
     fan_mode: u8,
@@ -677,25 +650,15 @@ pub fn encode_fccu_settings(
     i_gain: u16,
     d_gain: u16,
 ) -> ([u8; 8], [u8; 4]) {
-    let fan_data: [u8; 8] = [
-        fan_mode & 0x03,
-        0x00,
-        (p_gain & 0xFF) as u8,
-        ((p_gain >> 8) & 0xFF) as u8,
-        (i_gain & 0xFF) as u8,
-        ((i_gain >> 8) & 0xFF) as u8,
-        (d_gain & 0xFF) as u8,
-        ((d_gain >> 8) & 0xFF) as u8,
-    ];
+    let [p0, p1] = p_gain.to_le_bytes();
+    let [i0, i1] = i_gain.to_le_bytes();
+    let [d0, d1] = d_gain.to_le_bytes();
+    let [pi0, pi1] = purge_interval.to_le_bytes();
 
-    let valve_data: [u8; 4] = [
-        (purge_interval & 0xFF) as u8,
-        ((purge_interval >> 8) & 0xFF) as u8,
-        100u8,
-        0x00,
-    ];
-
-    (fan_data, valve_data)
+    (
+        [fan_mode & 0x03, 0x00, p0, p1, i0, i1, d0, d1],
+        [pi0, pi1, 100u8, 0x00],
+    )
 }
 
 /// Encodes vehicle lighting flags into the `MCU_LIGHTING (0x400)` single-byte payload.
@@ -732,35 +695,51 @@ pub fn validate_db_config(config: &DbConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Executes `FCCU_FAN (0x513)` transmission with explicit `CMD_FAN_ON` and `CMD_FAN_DUTY` (`0..=100%`).
+pub fn execute_fccu_fan(state: bool, duty: u8, can_state: &CanState) -> Result<String, String> {
+    let (can_id, name, payload) = encode_fccu_fan(state, duty);
+    let clamped_duty = payload[1];
+    let state_label = if state { "ON" } else { "OFF" };
+    println!(
+        "[CAN TX] {} (0x{:08X}): [0x{:02X}, 0x{:02X}] → {} ({}%)",
+        name, can_id, payload[0], clamped_duty, state_label, clamped_duty
+    );
+
+    let driver = can_state
+        .driver()
+        .ok_or_else(|| "Brak adaptera PCAN-USB — ramka nie została wysłana".to_string())?;
+    driver
+        .write(can_id, &payload)
+        .map_err(|e| format!("CAN write error 0x{:05X} for {}", e, name))?;
+
+    Ok(format!("{} → {} ({}%)", name, state_label, clamped_duty))
+}
+
 /// Executes FCCU command transmission against shared `CanState`.
 pub fn execute_fccu_command(
     command_type: &str,
     state: bool,
     can_state: &CanState,
 ) -> Result<String, String> {
-    let (can_id, name, payload) = encode_fccu_command(command_type, state)?;
-    println!(
-        "[CAN TX] {} (0x{:08X}): [0x{:02X}] → {}",
-        name,
-        can_id,
-        payload[0],
-        if state { "ON" } else { "OFF" }
-    );
-
-    let driver_opt = can_state.0.read().ok().and_then(|guard| guard.clone());
-    if let Some(ref driver) = driver_opt {
-        driver.write(can_id, &payload).map_err(|e| {
-            format!("CAN write error 0x{:05X} for {}", e, name)
-        })?;
-    } else {
-        return Err("Brak adaptera PCAN-USB — ramka nie została wysłana".to_string());
+    if command_type == "fan_on" {
+        return execute_fccu_fan(state, if state { 100 } else { 0 }, can_state);
     }
 
-    Ok(format!(
-        "{} → {}",
-        name,
-        if state { "ON" } else { "OFF" }
-    ))
+    let (can_id, name, payload) = encode_fccu_command(command_type, state)?;
+    let state_label = if state { "ON" } else { "OFF" };
+    println!(
+        "[CAN TX] {} (0x{:08X}): [0x{:02X}] → {}",
+        name, can_id, payload[0], state_label
+    );
+
+    let driver = can_state
+        .driver()
+        .ok_or_else(|| "Brak adaptera PCAN-USB — ramka nie została wysłana".to_string())?;
+    driver
+        .write(can_id, &payload)
+        .map_err(|e| format!("CAN write error 0x{:05X} for {}", e, name))?;
+
+    Ok(format!("{} → {}", name, state_label))
 }
 
 /// Executes FCCU fan & valve settings transmission against shared `CanState`.
@@ -784,17 +763,15 @@ pub fn execute_fccu_settings(
         valve_data, purge_interval
     );
 
-    let driver_opt = can_state.0.read().ok().and_then(|guard| guard.clone());
-    if let Some(ref driver) = driver_opt {
-        driver
-            .write(0x520, &fan_data)
-            .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_FAN_SETTINGS (0x520)", e))?;
-        driver
-            .write(0x521, &valve_data)
-            .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_VALVE_SETTINGS (0x521)", e))?;
-    } else {
-        return Err("Brak adaptera PCAN-USB — ustawienia nie zostały wysłane".to_string());
-    }
+    let driver = can_state
+        .driver()
+        .ok_or_else(|| "Brak adaptera PCAN-USB — ustawienia nie zostały wysłane".to_string())?;
+    driver
+        .write(0x520, &fan_data)
+        .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_FAN_SETTINGS (0x520)", e))?;
+    driver
+        .write(0x521, &valve_data)
+        .map_err(|e| format!("CAN write error 0x{:05X} for FCCU_VALVE_SETTINGS (0x521)", e))?;
 
     Ok(format!(
         "Wysłano FCCU Settings: fan_mode={}, purge={}s, PID=({},{},{})",
@@ -826,14 +803,12 @@ pub fn execute_lighting(
         byte0, headlight, position_light, brake_light, left_indicator, right_indicator, hazard
     );
 
-    let driver_opt = can_state.0.read().ok().and_then(|guard| guard.clone());
-    if let Some(ref driver) = driver_opt {
-        driver
-            .write(0x400, &[byte0])
-            .map_err(|e| format!("CAN write error 0x{:05X} for MCU_LIGHTING", e))?;
-    } else {
-        return Err("Brak adaptera PCAN-USB — oświetlenie nie zostało wysłane".to_string());
-    }
+    let driver = can_state
+        .driver()
+        .ok_or_else(|| "Brak adaptera PCAN-USB — oświetlenie nie zostało wysłane".to_string())?;
+    driver
+        .write(0x400, &[byte0])
+        .map_err(|e| format!("CAN write error 0x{:05X} for MCU_LIGHTING", e))?;
 
     Ok(format!(
         "Wysłano Lighting: H={} P={} B={} L={} R={} Hz={}",
@@ -846,12 +821,7 @@ pub fn read_can_status(can_state: &CanState) -> bool {
     can_state
         .0
         .read()
-        .map(|guard| {
-            guard
-                .as_ref()
-                .map(|driver| driver.is_hardware_ok())
-                .unwrap_or(false)
-        })
+        .map(|guard| guard.as_ref().is_some_and(|driver| driver.is_hardware_ok()))
         .unwrap_or(false)
 }
 
@@ -882,6 +852,16 @@ fn send_fccu_command(
     can_state: State<'_, CanState>,
 ) -> Result<String, String> {
     execute_fccu_command(&command_type, state, &can_state)
+}
+
+/// Send `FCCU_FAN (0x80000513 → 0x513)` with `CMD_FAN_ON` and `CMD_FAN_DUTY` (`0..=100%`).
+#[tauri::command]
+fn send_fccu_fan(
+    state: bool,
+    duty: u8,
+    can_state: State<'_, CanState>,
+) -> Result<String, String> {
+    execute_fccu_fan(state, duty, &can_state)
 }
 
 /// Send FCCU settings
@@ -938,21 +918,15 @@ async fn reconnect_pcan<R: Runtime>(
     app_handle: AppHandle<R>,
     can_state: State<'_, CanState>,
 ) -> Result<String, String> {
-    let preferred_channel = get_preferred_pcan_channel();
-    match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
+    match PcanDriver::new_auto(get_preferred_pcan_channel(), PCAN_BAUD_500K) {
         Ok(driver) => {
             let ch = driver.channel();
-            let arc_driver = Arc::new(driver);
-            if let Ok(mut guard) = can_state.0.write() {
-                *guard = Some(arc_driver);
-            }
+            set_driver(&can_state.0, Some(Arc::new(driver)));
             let _ = app_handle.emit("can-connection-status", true);
             Ok(format!("Połączono z adapterem PCAN-USB (kanał 0x{:02X})", ch))
         }
         Err(e) => {
-            if let Ok(mut guard) = can_state.0.write() {
-                *guard = None;
-            }
+            set_driver(&can_state.0, None);
             let _ = app_handle.emit("can-connection-status", false);
             Err(format!("Nie wykryto adaptera PCAN-USB: {}", e))
         }
@@ -970,7 +944,7 @@ fn get_db_status(state: State<'_, DbConfigState>) -> DbStatus {
         .status
         .read()
         .map(|s| s.clone())
-        .unwrap_or(DbStatus {
+        .unwrap_or_else(|_| DbStatus {
             connected: false,
             message: "Nieznany".to_string(),
         })
@@ -988,6 +962,7 @@ async fn save_db_config(
 pub fn register_app_handlers<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         send_fccu_command,
+        send_fccu_fan,
         send_fccu_settings,
         send_lighting,
         get_db_config,
@@ -1002,8 +977,7 @@ pub fn register_app_handlers<R: Runtime>(builder: tauri::Builder<R>) -> tauri::B
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let initial_config = load_initial_db_config();
-    let (config_tx, config_rx) = tokio::sync::watch::channel(initial_config);
+    let (config_tx, config_rx) = tokio::sync::watch::channel(load_initial_db_config());
     let db_status = Arc::new(RwLock::new(DbStatus {
         connected: false,
         message: "Inicjalizacja połączenia...".to_string(),
@@ -1020,16 +994,11 @@ pub fn run() {
             .manage(db_state),
     )
         .setup(move |app| {
-            let app_handle = app.handle().clone();
-            let can_handle = app.handle().clone();
-
             // Start PostgreSQL stream (Grafana tab)
-            start_pg_stream(app_handle, config_rx, db_status);
+            start_pg_stream(app.handle().clone(), config_rx, db_status);
 
             // Try to initialize PCAN-USB adapter (auto-detect free channel or read PCAN_CHANNEL env var)
-            let preferred_channel = get_preferred_pcan_channel();
-
-            let pcan_initial = match PcanDriver::new_auto(preferred_channel, PCAN_BAUD_500K) {
+            let pcan_initial = match PcanDriver::new_auto(get_preferred_pcan_channel(), PCAN_BAUD_500K) {
                 Ok(driver) => {
                     println!(
                         "[PCAN] Adapter PCAN-USB (kanał 0x{:02X}) gotowy do pracy!",
@@ -1050,7 +1019,7 @@ pub fn run() {
             app.manage(CanState(pcan_holder.clone()));
 
             // Start CAN receive stream
-            start_can_stream(can_handle, pcan_holder);
+            start_can_stream(app.handle().clone(), pcan_holder);
 
             Ok(())
         })
@@ -1206,6 +1175,20 @@ mod tests {
             (0x513, "FCCU_FAN", [0x00])
         );
         assert!(encode_fccu_command("invalid_cmd", true).is_err());
+
+        // 2-byte FCCU_FAN with CMD_FAN_ON and CMD_FAN_DUTY (0..=100%)
+        let (fan_id, fan_name, fan_payload) = encode_fccu_fan(true, 75);
+        assert_eq!((fan_id, fan_name, fan_payload), (0x513, "FCCU_FAN", [0x01, 75]));
+
+        let (_, _, clamped_payload) = encode_fccu_fan(true, 150);
+        assert_eq!(clamped_payload, [0x01, 100]);
+
+        let parser = create_dbc_parser();
+        let mut buf = [0u8; 8];
+        buf[..2].copy_from_slice(&fan_payload);
+        let decoded = parser.decode_msg(fan_id | (1 << 31), &buf).expect("FCCU_FAN in DBC");
+        assert_eq!(decoded.signals["CMD_FAN_ON"].value.physical, 1.0);
+        assert_eq!(decoded.signals["CMD_FAN_DUTY"].value.physical, 75.0);
     }
 
     #[test]
