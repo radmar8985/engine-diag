@@ -24,6 +24,8 @@
   });
   let showPassword = $state(false);
   let isSaving = $state(false);
+  let isDisconnecting = $state(false);
+  let isReconnecting = $state(false);
   let saveFeedback = $state<{ type: 'success' | 'error'; message: string } | null>(null);
   let isConfigExpanded = $state(true);
 
@@ -66,9 +68,17 @@
     isSaving = true;
     saveFeedback = null;
     try {
-      const res = await invoke<string>('save_db_config', { config: dbConfig });
+      const payload: DbConfig = {
+        host: String(dbConfig.host ?? '').trim(),
+        port: Number(dbConfig.port) || 5432,
+        user: String(dbConfig.user ?? '').trim(),
+        password: String(dbConfig.password ?? ''),
+        dbname: String(dbConfig.dbname ?? '').trim()
+      };
+      dbConfig = payload;
+      const res = await invoke<string>('save_db_config', { config: payload });
       try {
-        localStorage.setItem('engine_db_config', JSON.stringify(dbConfig));
+        localStorage.setItem('engine_db_config', JSON.stringify(payload));
       } catch (e) {
         console.warn('Nie udało się zapisać konfiguracji do localStorage:', e);
       }
@@ -83,6 +93,39 @@
       };
     } finally {
       isSaving = false;
+    }
+  }
+
+  async function handleDisconnectDb() {
+    isDisconnecting = true;
+    saveFeedback = null;
+    try {
+      const res = await invoke<string>('disconnect_db');
+      dbStatus.set({ connected: false, message: 'Rozłączono ręcznie' });
+      saveFeedback = { type: 'success', message: res };
+    } catch (err: any) {
+      saveFeedback = {
+        type: 'error',
+        message: typeof err === 'string' ? err : (err?.message || 'Nie udało się rozłączyć z bazą')
+      };
+    } finally {
+      isDisconnecting = false;
+    }
+  }
+
+  async function handleReconnectDb() {
+    isReconnecting = true;
+    saveFeedback = null;
+    try {
+      const res = await invoke<string>('reconnect_db');
+      saveFeedback = { type: 'success', message: res };
+    } catch (err: any) {
+      saveFeedback = {
+        type: 'error',
+        message: typeof err === 'string' ? err : (err?.message || 'Nie udało się wznowić połączenia')
+      };
+    } finally {
+      isReconnecting = false;
     }
   }
 
@@ -158,14 +201,35 @@
         <span class="status-text">{$dbStatus.connected ? 'Połączono' : 'Rozłączono'}: {$dbStatus.message}</span>
       </div>
     </div>
-    <button
-      type="button"
-      class="btn-toggle-config"
-      onclick={() => (isConfigExpanded = !isConfigExpanded)}
-      aria-label="Rozwiń lub zwiń konfigurację bazy"
-    >
-      {isConfigExpanded ? 'Zwiń ▲' : 'Ustawienia połączenia ▼'}
-    </button>
+    <div class="db-config-header-actions">
+      {#if $dbStatus.connected}
+        <button
+          type="button"
+          class="btn-disconnect-db"
+          disabled={isDisconnecting}
+          onclick={handleDisconnectDb}
+        >
+          {isDisconnecting ? 'Rozłączanie...' : 'Rozłącz'}
+        </button>
+      {:else if $dbStatus.message === 'Rozłączono ręcznie'}
+        <button
+          type="button"
+          class="btn-reconnect-db"
+          disabled={isReconnecting}
+          onclick={handleReconnectDb}
+        >
+          {isReconnecting ? 'Łączenie...' : 'Połącz'}
+        </button>
+      {/if}
+      <button
+        type="button"
+        class="btn-toggle-config"
+        onclick={() => (isConfigExpanded = !isConfigExpanded)}
+        aria-label="Rozwiń lub zwiń konfigurację bazy"
+      >
+        {isConfigExpanded ? 'Zwiń ▲' : 'Ustawienia połączenia ▼'}
+      </button>
+    </div>
   </div>
 
   {#if isConfigExpanded}
@@ -263,6 +327,9 @@
           <div class="db-disabled-desc">
             Wykresy telemetryczne są nieaktywne. Wprowadź parametry bazy w panelu powyżej i kliknij „Zastosuj i połącz z bazą”.
           </div>
+          {#if $dbStatus.message}
+            <div class="db-disabled-error">Szczegóły: {$dbStatus.message}</div>
+          {/if}
         </div>
       </div>
     </div>
@@ -336,6 +403,50 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .db-config-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .btn-disconnect-db {
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fca5a5;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn-disconnect-db:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.26);
+    color: #ffffff;
+    border-color: #ef4444;
+  }
+  .btn-disconnect-db:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .btn-reconnect-db {
+    background: linear-gradient(135deg, #2563eb, #1d4ed8);
+    border: 1px solid #3b82f6;
+    color: #ffffff;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn-reconnect-db:hover:not(:disabled) {
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
+  }
+  .btn-reconnect-db:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
   .btn-toggle-config {
     background-color: #27272a;
@@ -515,5 +626,13 @@
     font-size: 0.8rem;
     color: #a1a1aa;
     margin-top: 3px;
+  }
+
+  .db-disabled-error {
+    font-size: 0.78rem;
+    color: #fca5a5;
+    margin-top: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    word-break: break-word;
   }
 </style>

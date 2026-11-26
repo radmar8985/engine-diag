@@ -12,12 +12,14 @@ describe('chart-configs unit tests', () => {
     expect(cfg.power.data).toHaveLength(3);
   });
 
-  it('creates CAN voltage and current charts with 60s window layout', () => {
+  it('creates CAN voltage, current, and H2 flowmeter charts with 60s window layout', () => {
     const cfg = createCanChartConfigs();
     expect(cfg.chart1.data).toHaveLength(1);
     expect(cfg.chart2.data).toHaveLength(1);
+    expect(cfg.chart3.data).toHaveLength(1);
     expect(cfg.chart1.data[0].name).toContain('Napięcie FC');
     expect(cfg.chart2.data[0].name).toContain('Prąd FC');
+    expect(cfg.chart3.data[0].name).toContain('Przepływ H₂');
     expect(cfg.chart1.layout.xaxis?.range).toEqual([0, 60]);
   });
 });

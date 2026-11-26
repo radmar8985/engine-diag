@@ -2,7 +2,8 @@ import type { PlotLayout, PlotlyConfig } from 'plotly.js-dist-min';
 
 export const MAX_POINTS = 60;
 export const CAN_WINDOW_MS = 60_000;
-export const CAN_MAX_POINTS = 1200;
+export const CAN_MAX_POINTS = 3000;
+export const CAN_FLOW_MAX_POINTS = 6000;
 
 export interface TimedSample {
   t: number;

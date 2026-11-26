@@ -9,6 +9,7 @@
     plotlyOptions,
     CAN_WINDOW_MS,
     CAN_MAX_POINTS,
+    CAN_FLOW_MAX_POINTS,
     formatPlotlyTimestamp,
     pruneWindowSamples,
     fmtVal,
@@ -16,11 +17,12 @@
     calcRms,
     type TimedSample
   } from '$lib/chartUtils';
-  import { canConnected } from '$lib/stores';
-  import type { CanReadData, ChartSeriesStats, FccuSettings, LightingState } from '$lib/types';
+  import { canConnected, canConnectionInfo } from '$lib/stores';
+  import type { CanConnectionInfo, CanReadData, ChartSeriesStats, FccuSettings, LightingState } from '$lib/types';
 
   let canChart1: HTMLElement;
   let canChart2: HTMLElement;
+  let canChart3: HTMLElement;
   let canChartsInitialized = false;
 
   function buildCanXAxisRange(nowMs: number): [string, string] {
@@ -62,12 +64,17 @@
     chart2: {
       data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Prąd FC (A)', line: { color: '#3b82f6', width: 1.5 } }],
       layout: { ...canChartLayout, yaxis: { ...canChartLayout.yaxis, title: '' } }
+    },
+    chart3: {
+      data: [{ x: [] as string[], y: [] as number[], type: 'scatter', mode: 'lines', name: 'Przepływ H₂ (Ln/min)', line: { color: '#06b6d4', width: 1.5 } }],
+      layout: { ...canChartLayout, yaxis: { ...canChartLayout.yaxis, title: '' } }
     }
   };
 
   let canStats = emptyCanStats();
   let chart1Samples: TimedSample[] = [];
   let chart2Samples: TimedSample[] = [];
+  let chart3Samples: TimedSample[] = [];
 
   let hasCanData = false;
   let fccuState = 3;
@@ -76,6 +83,98 @@
   let fccuFanState = false;
   let fccuFanDuty = 0;
   let fccuVersion = '—';
+  let fccuBuildId = 0;
+  let fccuVehicleType = 0;
+  let fccuFuelcellType = 0;
+
+  // Extended DBC telemetry state
+  let h2TotalVolume = 0;
+  let h2LpPressure = 0;
+  let h2HpPressure = 0;
+  let h2LeakageVoltage = 0;
+  let fcTemp = 0;
+  let ambientTemp = 0;
+  let ambientHumidity = 0;
+  let ambientPressure = 0;
+
+  let fcPowerW = 0;
+  let energyWh = 0;
+  let fccuDcdcVoltage = 0;
+  let fccuDcdcCurrent = 0;
+  let fccuLoadCurrent = 0;
+  let fccuHoCurrent1 = 0;
+  let fccuHoCurrent2 = 0;
+  let fccuHoCurrent3 = 0;
+  let scVoltage = 0;
+  let scCurrent = 0;
+  let mcSupplyVoltage = 0;
+  let mcSupplyCurrent = 0;
+  let abVoltage = 0;
+  let abCurrent = 0;
+
+  let speedKmh = 0;
+  let rpmVal = 0;
+  let accelPedalV = 0;
+  let brakePedalV = 0;
+  let accelOutputV = 0;
+  let brakeOutputV = 0;
+  let mcuStatus = 0;
+  let vehicleType = 0;
+  let vehicleAllowedToMove = false;
+  let motorControllerEnabled = false;
+  let mainValveEnabled = false;
+  let mcuActiveFaults: string[] = [];
+  let ccuStatus = 0;
+  let swuCanState = 0;
+  let lapNumber = 0;
+  let lapTimeMs = 0;
+  let totalTimeMs = 0;
+  let lcuFrontFault = false;
+  let lcuBackFault = false;
+
+  const MCU_STATUS_LABELS: Record<number, string> = {
+    0: 'INIT',
+    1: 'IDLE',
+    2: 'STARTING',
+    3: 'SHUTTING_DOWN',
+    4: 'RUNNING'
+  };
+
+  const VEHICLE_TYPE_LABELS: Record<number, string> = {
+    0: 'HYDROS_V1',
+    1: 'HYDROS_V2',
+    2: 'BOLID',
+    3: 'HYDRA'
+  };
+
+  const FUELCELL_TYPE_LABELS: Record<number, string> = {
+    0: 'PROTIUM',
+    1: 'NEW_CELL'
+  };
+
+  const CCU_STATUS_LABELS: Record<number, string> = {
+    0: 'INIT',
+    1: 'OPERATIONAL',
+    2: 'WARNING',
+    3: 'BUS_OFF',
+    4: 'DFU'
+  };
+
+  const SWU_CAN_STATE_LABELS: Record<number, string> = {
+    0: 'ERROR_ACTIVE',
+    1: 'ERROR_WARNING',
+    2: 'ERROR_PASSIVE',
+    3: 'BUS_OFF',
+    4: 'STOPPED'
+  };
+
+  function formatDurationMs(ms: number): string {
+    const totalSec = Math.floor((ms || 0) / 1000);
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    const tenths = Math.floor(((ms || 0) % 1000) / 100);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${tenths}`;
+  }
 
   const FCCU_STATES: Record<number, { label: string; color: string }> = {
     0: { label: 'Inicjalizacja', color: '#3b82f6' },
@@ -98,10 +197,11 @@
     return { system_enable: false, main_valve: false, manual_purge: false, fan_on: false };
   }
 
-  function emptyCanStats(): Record<'chart1' | 'chart2', ChartSeriesStats> {
+  function emptyCanStats(): Record<'chart1' | 'chart2' | 'chart3', ChartSeriesStats> {
     return {
       chart1: { newest: 0, average: 0, rms: 0 },
-      chart2: { newest: 0, average: 0, rms: 0 }
+      chart2: { newest: 0, average: 0, rms: 0 },
+      chart3: { newest: 0, average: 0, rms: 0 }
     };
   }
 
@@ -128,6 +228,7 @@
   }
 
   let isReconnectingPcan = false;
+  let isDisconnectingPcan = false;
 
   async function handleReconnectPcan() {
     isReconnectingPcan = true;
@@ -139,6 +240,19 @@
       showToast(typeof err === 'string' ? err : (err?.message || 'Nie wykryto adaptera PCAN-USB'), true);
     } finally {
       isReconnectingPcan = false;
+    }
+  }
+
+  async function handleDisconnectPcan() {
+    isDisconnectingPcan = true;
+    try {
+      const res = await invoke<string>('disconnect_pcan');
+      showToast(res, false);
+      applyCanStatus(false);
+    } catch (err: any) {
+      showToast(typeof err === 'string' ? err : (err?.message || 'Błąd rozłączania PCAN-USB'), true);
+    } finally {
+      isDisconnectingPcan = false;
     }
   }
 
@@ -294,18 +408,19 @@
     }
   }
 
-  function updateChartSeries(
+  function updateChartSeriesBatch(
     chartEl: HTMLElement,
     samples: TimedSample[],
-    val: number,
+    newPoints: TimedSample[],
     nowMs: number,
-    xRange: [string, string]
+    xRange: [string, string],
+    maxPoints: number = CAN_MAX_POINTS
   ): { samples: TimedSample[]; stats: ChartSeriesStats } {
     const next = pruneWindowSamples(
-      [...samples, { t: nowMs, v: val }],
+      [...samples, ...newPoints],
       nowMs,
       CAN_WINDOW_MS,
-      CAN_MAX_POINTS
+      maxPoints
     );
     Plotly.update(
       chartEl,
@@ -314,10 +429,21 @@
       [0]
     );
     const values = next.map((s) => s.v);
+    const newest = newPoints.length > 0 ? newPoints[newPoints.length - 1].v : (values[values.length - 1] ?? 0);
     return {
       samples: next,
-      stats: { newest: val, average: calcAvg(values), rms: calcRms(values) }
+      stats: { newest, average: calcAvg(values), rms: calcRms(values) }
     };
+  }
+
+  function updateChartSeries(
+    chartEl: HTMLElement,
+    samples: TimedSample[],
+    val: number,
+    nowMs: number,
+    xRange: [string, string]
+  ): { samples: TimedSample[]; stats: ChartSeriesStats } {
+    return updateChartSeriesBatch(chartEl, samples, [{ t: nowMs, v: val }], nowMs, xRange, CAN_MAX_POINTS);
   }
 
   const statRows: { label: string; key: keyof ChartSeriesStats }[] = [
@@ -400,8 +526,53 @@
     fccuFanState = false;
     fccuFanDuty = 0;
     fccuVersion = '—';
+    fccuBuildId = 0;
+    fccuVehicleType = 0;
+    fccuFuelcellType = 0;
+    h2TotalVolume = 0;
+    h2LpPressure = 0;
+    h2HpPressure = 0;
+    h2LeakageVoltage = 0;
+    fcTemp = 0;
+    ambientTemp = 0;
+    ambientHumidity = 0;
+    ambientPressure = 0;
+    fcPowerW = 0;
+    energyWh = 0;
+    fccuDcdcVoltage = 0;
+    fccuDcdcCurrent = 0;
+    fccuLoadCurrent = 0;
+    fccuHoCurrent1 = 0;
+    fccuHoCurrent2 = 0;
+    fccuHoCurrent3 = 0;
+    scVoltage = 0;
+    scCurrent = 0;
+    mcSupplyVoltage = 0;
+    mcSupplyCurrent = 0;
+    abVoltage = 0;
+    abCurrent = 0;
+    speedKmh = 0;
+    rpmVal = 0;
+    accelPedalV = 0;
+    brakePedalV = 0;
+    accelOutputV = 0;
+    brakeOutputV = 0;
+    mcuStatus = 0;
+    vehicleType = 0;
+    vehicleAllowedToMove = false;
+    motorControllerEnabled = false;
+    mainValveEnabled = false;
+    mcuActiveFaults = [];
+    ccuStatus = 0;
+    swuCanState = 0;
+    lapNumber = 0;
+    lapTimeMs = 0;
+    totalTimeMs = 0;
+    lcuFrontFault = false;
+    lcuBackFault = false;
     chart1Samples = [];
     chart2Samples = [];
+    chart3Samples = [];
     canStats = emptyCanStats();
     clearAllPendingTimeouts();
     pendingCmds = idlePendingCmds();
@@ -415,16 +586,30 @@
     }
   }
 
+  function applyCanInfo(info: CanConnectionInfo) {
+    if (!info) return;
+    canConnectionInfo.set(info);
+    applyCanStatus(info.connected);
+  }
+
   onMount(() => {
     invoke<boolean>('get_can_status')
       .then(applyCanStatus)
       .catch(() => {});
 
-    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => applyCanStatus(event.payload));
+    invoke<CanConnectionInfo>('get_can_connection_info')
+      .then((info) => {
+        if (info) applyCanInfo(info);
+      })
+      .catch(() => {});
 
-    if (canChart1 && canChart2) {
+    const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => applyCanStatus(event.payload));
+    const unlistenCanInfo = listen<CanConnectionInfo>('can-connection-info', (event) => applyCanInfo(event.payload));
+
+    if (canChart1 && canChart2 && canChart3) {
       Plotly.newPlot(canChart1, canChartConfigs.chart1.data, canChartConfigs.chart1.layout, plotlyOptions);
       Plotly.newPlot(canChart2, canChartConfigs.chart2.data, canChartConfigs.chart2.layout, plotlyOptions);
+      Plotly.newPlot(canChart3, canChartConfigs.chart3.data, canChartConfigs.chart3.layout, plotlyOptions);
       canChartsInitialized = true;
     }
 
@@ -454,41 +639,147 @@
 
       if (d.fccu_fan_duty !== undefined) fccuFanDuty = d.fccu_fan_duty;
       if (d.fccu_version && d.fccu_version.trim().length > 0) fccuVersion = d.fccu_version;
+      if (d.fccu_build_id !== undefined) fccuBuildId = d.fccu_build_id;
+      if (d.fccu_vehicle_type !== undefined) fccuVehicleType = d.fccu_vehicle_type;
+      if (d.fccu_fuelcell_type !== undefined) fccuFuelcellType = d.fccu_fuelcell_type;
 
-      if (canChartsInitialized && canChart1 && canChart2) {
+      h2TotalVolume = d.h2_total_volume ?? 0;
+      h2LpPressure = d.h2_lp_pressure ?? 0;
+      h2HpPressure = d.h2_hp_pressure || d.h2_high_pressure || 0;
+      h2LeakageVoltage = d.fccu_leakage_voltage || d.h2_leakage_sensor_voltage || 0;
+      fcTemp = d.fc_temp ?? 0;
+      ambientTemp = d.ambient_temp ?? 0;
+      ambientHumidity = d.ambient_humidity ?? 0;
+      ambientPressure = d.ambient_pressure ?? 0;
+
+      fcPowerW = d.fc_w ?? 0;
+      energyWh = d.energy_wh ?? 0;
+      fccuDcdcVoltage = d.fccu_dcdc_voltage ?? 0;
+      fccuDcdcCurrent = d.fccu_dcdc_current ?? 0;
+      fccuLoadCurrent = d.fccu_load_current ?? 0;
+      fccuHoCurrent1 = d.fccu_ho_current_1 ?? 0;
+      fccuHoCurrent2 = d.fccu_ho_current_2 ?? 0;
+      fccuHoCurrent3 = d.fccu_ho_current_3 ?? 0;
+      scVoltage = d.sc_voltage ?? 0;
+      scCurrent = d.sc_current ?? 0;
+      mcSupplyVoltage = d.mc_supply_voltage ?? 0;
+      mcSupplyCurrent = d.mc_supply_current ?? 0;
+      abVoltage = d.ab_voltage ?? 0;
+      abCurrent = d.ab_current ?? 0;
+
+      speedKmh = d.speed ?? 0;
+      rpmVal = d.rpm ?? 0;
+      accelPedalV = d.accel_pedal_voltage ?? 0;
+      brakePedalV = d.brake_pedal_voltage ?? 0;
+      accelOutputV = d.accel_output_voltage ?? 0;
+      brakeOutputV = d.brake_output_voltage ?? 0;
+      mcuStatus = d.mcu_status ?? 0;
+      vehicleType = d.vehicle_type ?? 0;
+      vehicleAllowedToMove = d.vehicle_allowed_to_move ?? false;
+      motorControllerEnabled = d.motor_controller_enabled ?? false;
+      mainValveEnabled = d.main_valve_enabled ?? false;
+      mcuActiveFaults = d.mcu_active_faults ?? [];
+      ccuStatus = d.ccu_status ?? 0;
+      swuCanState = d.swu_can_state ?? 0;
+      lapNumber = d.lap_number ?? 0;
+      lapTimeMs = d.lap_time_ms ?? 0;
+      totalTimeMs = d.total_time_ms ?? 0;
+      lcuFrontFault = d.lcu_front_fault ?? false;
+      lcuBackFault = d.lcu_back_fault ?? false;
+
+      if (canChartsInitialized && canChart1 && canChart2 && canChart3) {
         const xRange = buildCanXAxisRange(nowMs);
         const r1 = updateChartSeries(canChart1, chart1Samples, d.fc_output_voltage ?? 0, nowMs, xRange);
         const r2 = updateChartSeries(canChart2, chart2Samples, d.fc_output_current ?? 0, nowMs, xRange);
+        const flowBatch: TimedSample[] =
+          d.h2_flow_samples && d.h2_flow_samples.length > 0
+            ? d.h2_flow_samples.map((s) => ({ t: s.t_ms || nowMs, v: s.flow }))
+            : [{ t: nowMs, v: d.h2_flow ?? 0 }];
+        const r3 = updateChartSeriesBatch(canChart3, chart3Samples, flowBatch, nowMs, xRange, CAN_FLOW_MAX_POINTS);
         chart1Samples = r1.samples;
         chart2Samples = r2.samples;
-        canStats = { chart1: r1.stats, chart2: r2.stats };
+        chart3Samples = r3.samples;
+        canStats = { chart1: r1.stats, chart2: r2.stats, chart3: r3.stats };
       }
     });
 
     return () => {
       unlistenCan.then((u) => u());
       unlistenCanStatus.then((u) => u());
+      unlistenCanInfo.then((u) => u());
       clearAllPendingTimeouts();
     };
   });
 </script>
 
 <div class="can-view-wrapper" class:disabled={!$canConnected}>
+  <div class="can-connection-bar" data-testid="can-connection-bar">
+    <div class="can-connection-bar-left">
+      <span class="can-connection-title">Połączenie CAN (PCAN-USB)</span>
+      <div
+        class="can-status-badge {$canConnected ? 'status-connected' : 'status-disconnected'}"
+        title={$canConnectionInfo.channel_label}
+      >
+        <span class="status-dot"></span>
+        <span class="status-text">
+          {#if $canConnected}
+            Połączono: {$canConnectionInfo.channel_label} · {$canConnectionInfo.baudrate_label}
+          {:else if $canConnectionInfo.manual_disconnected}
+            Rozłączono ręcznie
+          {:else}
+            Rozłączono — oczekiwanie na adapter
+          {/if}
+        </span>
+      </div>
+    </div>
+    <div class="can-connection-bar-actions">
+      {#if $canConnected}
+        <button
+          type="button"
+          class="btn-disconnect-can"
+          disabled={isDisconnectingPcan}
+          on:click={handleDisconnectPcan}
+        >
+          {isDisconnectingPcan ? 'Rozłączanie...' : 'Rozłącz'}
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="btn-reconnect-pcan"
+          disabled={isReconnectingPcan}
+          on:click={handleReconnectPcan}
+        >
+          {isReconnectingPcan ? 'Łączenie...' : 'Połącz'}
+        </button>
+      {/if}
+    </div>
+  </div>
+
   {#if !$canConnected}
     <div class="can-disconnected-banner">
       <div class="can-disconnected-content">
         <span class="can-disconnected-icon">🔌</span>
         <div class="can-disconnected-text">
-          <div class="can-disconnected-title">Brak połączenia z adapterem PCAN-USB (magistrala CAN)</div>
+          <div class="can-disconnected-title">
+            {$canConnectionInfo.manual_disconnected
+              ? 'Połączenie z adapterem PCAN-USB zostało rozłączone ręcznie'
+              : 'Brak połączenia z adapterem PCAN-USB (magistrala CAN)'}
+          </div>
           <div class="can-disconnected-desc">
-            Zakładka CAN jest zablokowana. Trwa automatyczne nasłuchiwanie USB w tle — po podłączeniu adaptera połączenie zostanie wznowione samoczynnie.
+            {#if $canConnectionInfo.manual_disconnected}
+              Zakładka CAN jest zablokowana. Kliknij „Połącz”, aby ponownie nawiązać komunikację z adapterem PCAN-USB.
+            {:else}
+              Zakładka CAN jest zablokowana. Trwa automatyczne nasłuchiwanie USB w tle — po podłączeniu adaptera połączenie zostanie wznowione samoczynnie.
+            {/if}
           </div>
         </div>
         <div class="can-disconnected-actions">
-          <div class="auto-listening-pill">
-            <span class="pulsing-circle"></span>
-            <span>Nasłuchiwanie USB w toku...</span>
-          </div>
+          {#if !$canConnectionInfo.manual_disconnected}
+            <div class="auto-listening-pill">
+              <span class="pulsing-circle"></span>
+              <span>Nasłuchiwanie USB w toku...</span>
+            </div>
+          {/if}
           <button
             type="button"
             class="btn-reconnect-pcan"
@@ -534,7 +825,15 @@
     <div class="top-status-item">
       <span class="status-lbl">Wersja oprogramowania</span>
       <span class="status-val bold">{fccuVersion}</span>
-      <span class="status-sub">{fccuVersion === '—' ? 'Brak odczytu wersji' : 'Oprogramowanie FCCU'}</span>
+      <span class="status-sub">
+        {#if fccuVersion === '—'}
+          Brak odczytu wersji
+        {:else if fccuBuildId > 0}
+          Build #{fccuBuildId} · {FUELCELL_TYPE_LABELS[fccuFuelcellType] ?? 'FCCU'}
+        {:else}
+          Oprogramowanie FCCU
+        {/if}
+      </span>
     </div>
   </div>
 
@@ -581,6 +880,171 @@
           </div>
         {/each}
       </div>
+    </div>
+  </div>
+
+  <div class="chart-section-card" data-testid="flowmeter-chart-card">
+    <div class="chart-header-row">
+      <h3 class="chart-main-title">Przepływ wodoru (przepływomierz H₂)</h3>
+      <div class="chart-header-meta">
+        <span class="chart-meta-badge">Zużycie całkowite: {fmtVal(h2TotalVolume)} Ln</span>
+        <span class="chart-header-time">Ostatnie 60 s</span>
+      </div>
+    </div>
+    <div class="chart-card-content">
+      <div class="chart-graph-box">
+        {#if !hasCanData}
+          <div class="chart-empty-hint">Oczekiwanie na próbki CAN</div>
+        {/if}
+        <div class="plotly-chart-inner" bind:this={canChart3}></div>
+      </div>
+      <div class="stats-column">
+        {#each statRows as row}
+          <div class="stat-box">
+            <span class="stat-box-lbl">{row.label}</span>
+            <span class="stat-box-val">{fmtVal(canStats.chart3[row.key])} Ln/min</span>
+          </div>
+        {/each}
+      </div>
+    </div>
+  </div>
+
+  <div class="section-card" data-testid="dbc-hydrogen-env-card">
+    <div class="section-card-header">
+      <h3 class="section-card-title">WODÓR I ŚRODOWISKO (FCCU)</h3>
+    </div>
+    <div class="telemetry-grid">
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Ciśnienie H₂ (LP)</span>
+        <span class="telemetry-val">{fmtVal(h2LpPressure)} <span class="telemetry-unit">bar</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Ciśnienie H₂ (HP)</span>
+        <span class="telemetry-val">{fmtVal(h2HpPressure, 1)} <span class="telemetry-unit">bar</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Czujnik wycieku H₂</span>
+        <span class="telemetry-val">{fmtVal(h2LeakageVoltage)} <span class="telemetry-unit">V</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Zużycie całkowite H₂</span>
+        <span class="telemetry-val">{fmtVal(h2TotalVolume)} <span class="telemetry-unit">Ln</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Temperatura ogniwa</span>
+        <span class="telemetry-val">{fmtVal(fcTemp, 1)} <span class="telemetry-unit">°C</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Temperatura otoczenia</span>
+        <span class="telemetry-val">{fmtVal(ambientTemp, 1)} <span class="telemetry-unit">°C</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Wilgotność otoczenia</span>
+        <span class="telemetry-val">{fmtVal(ambientHumidity, 1)} <span class="telemetry-unit">%</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Ciśnienie atmosferyczne</span>
+        <span class="telemetry-val">{fmtVal(ambientPressure, 1)} <span class="telemetry-unit">hPa</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-card" data-testid="dbc-power-currents-card">
+    <div class="section-card-header">
+      <h3 class="section-card-title">ZASILANIE I PRĄDY (FCCU &amp; MCU)</h3>
+    </div>
+    <div class="telemetry-grid">
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Moc ogniwa (FC)</span>
+        <span class="telemetry-val">{fmtVal(fcPowerW, 0)} <span class="telemetry-unit">W</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Energia (Protium)</span>
+        <span class="telemetry-val">{fmtVal(energyWh, 0)} <span class="telemetry-unit">Wh</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Przetwornica DCDC</span>
+        <span class="telemetry-val">{fmtVal(fccuDcdcVoltage)} <span class="telemetry-unit">V</span> · {fmtVal(fccuDcdcCurrent)} <span class="telemetry-unit">A</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Prąd obciążenia (FCCU)</span>
+        <span class="telemetry-val">{fmtVal(fccuLoadCurrent)} <span class="telemetry-unit">A</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Czujniki HO-10P (1 / 2 / 3)</span>
+        <span class="telemetry-val telemetry-val-sm">{fmtVal(fccuHoCurrent1, 1)} / {fmtVal(fccuHoCurrent2, 1)} / {fmtVal(fccuHoCurrent3, 1)} <span class="telemetry-unit">A</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Superkondensator (SC)</span>
+        <span class="telemetry-val">{fmtVal(scVoltage)} <span class="telemetry-unit">V</span> · {fmtVal(scCurrent)} <span class="telemetry-unit">A</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Sterownik silnika (MC)</span>
+        <span class="telemetry-val">{fmtVal(mcSupplyVoltage)} <span class="telemetry-unit">V</span> · {fmtVal(mcSupplyCurrent)} <span class="telemetry-unit">A</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Akumulator pomocniczy (AB)</span>
+        <span class="telemetry-val">{fmtVal(abVoltage)} <span class="telemetry-unit">V</span> · {fmtVal(abCurrent)} <span class="telemetry-unit">A</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-card" data-testid="dbc-drive-diag-card">
+    <div class="section-card-header">
+      <h3 class="section-card-title">NAPĘD, STEROWNIKI I DIAGNOSTYKA (MCU / SWU / CCU / LCU)</h3>
+    </div>
+    <div class="telemetry-grid">
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Prędkość / Obroty</span>
+        <span class="telemetry-val">{fmtVal(speedKmh, 1)} <span class="telemetry-unit">km/h</span> · {fmtVal(rpmVal, 0)} <span class="telemetry-unit">rpm</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Pedały (Gaz / Hamulec)</span>
+        <span class="telemetry-val">{fmtVal(accelPedalV)} <span class="telemetry-unit">V</span> / {fmtVal(brakePedalV)} <span class="telemetry-unit">V</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Wyjścia SCADE (Gaz / Ham.)</span>
+        <span class="telemetry-val">{fmtVal(accelOutputV)} <span class="telemetry-unit">V</span> / {fmtVal(brakeOutputV)} <span class="telemetry-unit">V</span></span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Stan MCU / Pojazd</span>
+        <span class="telemetry-val telemetry-val-sm">{MCU_STATUS_LABELS[mcuStatus] ?? mcuStatus} · {VEHICLE_TYPE_LABELS[vehicleType || fccuVehicleType] ?? '—'}</span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Zezwolenie na jazdę / MC / Zawór</span>
+        <span class="telemetry-val telemetry-val-sm">
+          {vehicleAllowedToMove ? 'TAK' : 'NIE'} · MC: {motorControllerEnabled ? 'ON' : 'OFF'} · ZG: {mainValveEnabled ? 'ON' : 'OFF'}
+        </span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Stan CCU / SWU CAN</span>
+        <span class="telemetry-val telemetry-val-sm">{CCU_STATUS_LABELS[ccuStatus] ?? ccuStatus} · {SWU_CAN_STATE_LABELS[swuCanState] ?? swuCanState}</span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Okrążenie (SWU)</span>
+        <span class="telemetry-val telemetry-val-sm">#{lapNumber} · {formatDurationMs(lapTimeMs)} / {formatDurationMs(totalTimeMs)}</span>
+      </div>
+      <div class="telemetry-tile">
+        <span class="telemetry-lbl">Oświetlenie LCU (Przód / Tył)</span>
+        <span class="telemetry-val telemetry-val-sm">
+          <span class:diag-err={lcuFrontFault} class:diag-ok={!lcuFrontFault}>{lcuFrontFault ? 'BŁĄD' : 'OK'}</span>
+          /
+          <span class:diag-err={lcuBackFault} class:diag-ok={!lcuBackFault}>{lcuBackFault ? 'BŁĄD' : 'OK'}</span>
+        </span>
+      </div>
+    </div>
+
+    <div class="faults-bar">
+      <span class="faults-lbl">Błędy MCU:</span>
+      {#if mcuActiveFaults.length === 0}
+        <span class="fault-badge ok">Brak aktywnych błędów</span>
+      {:else}
+        <div class="fault-badges-list">
+          {#each mcuActiveFaults as fault}
+            <span class="fault-badge err">{fault}</span>
+          {/each}
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -786,11 +1250,99 @@
     transition: opacity 0.3s ease, filter 0.3s ease;
   }
 
-  .can-view-wrapper.disabled > *:not(.can-disconnected-banner):not(.toast-container) {
+  .can-view-wrapper.disabled > *:not(.can-disconnected-banner):not(.can-connection-bar):not(.toast-container) {
     opacity: 0.32;
     filter: grayscale(0.85);
     pointer-events: none;
     user-select: none;
+  }
+
+  .can-connection-bar {
+    pointer-events: auto;
+    background-color: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 12px;
+    padding: 12px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .can-connection-bar-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .can-connection-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #e4e4e7;
+  }
+
+  .can-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 9999px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    background-color: #27272a;
+    color: #a1a1aa;
+  }
+
+  .can-status-badge.status-connected {
+    background-color: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .can-status-badge.status-disconnected {
+    background-color: rgba(239, 68, 68, 0.12);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.25);
+  }
+
+  .can-status-badge .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background-color: currentColor;
+    flex-shrink: 0;
+  }
+
+  .can-connection-bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .btn-disconnect-can {
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fca5a5;
+    font-weight: 600;
+    font-size: 0.82rem;
+    padding: 7px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .btn-disconnect-can:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.26);
+    color: #ffffff;
+    border-color: #ef4444;
+  }
+
+  .btn-disconnect-can:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .can-disconnected-banner {
@@ -963,6 +1515,122 @@
   .chart-header-time {
     font-size: 0.75rem;
     color: #71717a;
+  }
+
+  .chart-header-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .chart-meta-badge {
+    font-size: 0.74rem;
+    font-weight: 600;
+    color: #22d3ee;
+    background: rgba(6, 182, 212, 0.12);
+    border: 1px solid rgba(6, 182, 212, 0.3);
+    padding: 2px 9px;
+    border-radius: 9999px;
+  }
+
+  .telemetry-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .telemetry-tile {
+    background-color: #121215;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .telemetry-lbl {
+    font-size: 0.7rem;
+    color: #a1a1aa;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .telemetry-val {
+    font-size: 0.96rem;
+    font-weight: 700;
+    color: #ffffff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .telemetry-val-sm {
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+
+  .telemetry-unit {
+    font-size: 0.72rem;
+    font-weight: 400;
+    color: #71717a;
+  }
+
+  .diag-ok {
+    color: #4ade80;
+  }
+
+  .diag-err {
+    color: #f87171;
+  }
+
+  .faults-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-top: 8px;
+    border-top: 1px solid #27272a;
+  }
+
+  .faults-lbl {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #a1a1aa;
+  }
+
+  .fault-badges-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .fault-badge {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 9999px;
+  }
+
+  .fault-badge.ok {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    color: #4ade80;
+  }
+
+  .fault-badge.err {
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    color: #f87171;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+
+  @media (max-width: 1100px) {
+    .telemetry-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
   }
 
   .chart-card-content {

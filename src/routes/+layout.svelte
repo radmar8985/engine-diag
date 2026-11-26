@@ -3,11 +3,15 @@
   import { page } from '$app/stores';
   import { listen } from '@tauri-apps/api/event';
   import { invoke } from '@tauri-apps/api/core';
-  import { currentReadings, canConnected, lastCanFrameTime, dbStatus, emptyEngineData } from '$lib/stores';
+  import { currentReadings, canConnected, canConnectionInfo, lastCanFrameTime, dbStatus, emptyEngineData } from '$lib/stores';
   import { fmtVal, getStatus } from '$lib/chartUtils';
-  import type { EngineData, CanReadData, DbStatus } from '$lib/types';
+  import { checkForAppUpdate, type Update } from '$lib/updater';
+  import UpdateBanner from '$lib/components/UpdateBanner.svelte';
+  import type { EngineData, CanReadData, CanConnectionInfo, DbStatus } from '$lib/types';
 
   let { children } = $props();
+  let availableUpdate = $state<Update | null>(null);
+  let updateDismissed = $state(false);
 
   let isCanTab = $derived($page.url.pathname === '/can');
   let isCurrentSourceConnected = $derived(
@@ -68,9 +72,39 @@
     }
   }
 
+  function applyCanInfo(info: CanConnectionInfo) {
+    if (!info) return;
+    canConnectionInfo.set(info);
+    applyCanStatus(info.connected);
+  }
+
+  async function handleSidebarCanToggle() {
+    if ($canConnected) {
+      await invoke('disconnect_pcan').catch(() => {});
+      applyCanStatus(false);
+    } else {
+      await invoke('reconnect_pcan').catch(() => {});
+    }
+  }
+
+  async function handleSidebarDbToggle() {
+    if ($dbStatus.connected) {
+      await invoke('disconnect_db').catch(() => {});
+      dbStatus.set({ connected: false, message: 'Rozłączono ręcznie' });
+    } else {
+      await invoke('reconnect_db').catch(() => {});
+    }
+  }
+
   onMount(() => {
     invoke<boolean>('get_can_status')
       .then(applyCanStatus)
+      .catch(() => {});
+
+    invoke<CanConnectionInfo>('get_can_connection_info')
+      .then((info) => {
+        if (info) applyCanInfo(info);
+      })
       .catch(() => {});
 
     invoke<DbStatus>('get_db_status')
@@ -79,7 +113,16 @@
       })
       .catch(() => {});
 
+    checkForAppUpdate()
+      .then((upd) => {
+        if (upd) {
+          availableUpdate = upd;
+        }
+      })
+      .catch(() => {});
+
     const unlistenCanStatus = listen<boolean>('can-connection-status', (event) => applyCanStatus(event.payload));
+    const unlistenCanInfo = listen<CanConnectionInfo>('can-connection-info', (event) => applyCanInfo(event.payload));
 
     const unlistenPg = listen<EngineData>('engine-data-update', (event) => {
       if (!isCanTab) {
@@ -113,7 +156,7 @@
       dbStatus.set(event.payload);
     });
 
-    const unlisteners = [unlistenPg, unlistenCan, unlistenDb, unlistenCanStatus];
+    const unlisteners = [unlistenPg, unlistenCan, unlistenDb, unlistenCanStatus, unlistenCanInfo];
     return () => {
       unlisteners.forEach((p) => p.then((u) => u()));
     };
@@ -175,9 +218,22 @@
             </span>
           </div>
           <div class="can-comm-row">
+            <span class="can-comm-label">Port / Kanał</span>
+            <span class="can-comm-value can-comm-desc" title={$canConnectionInfo.channel_label}>
+              {$canConnected ? $canConnectionInfo.channel_label : '—'}
+            </span>
+          </div>
+          <div class="can-comm-row">
             <span class="can-comm-label">Ostatnia ramka</span>
             <span class="can-comm-value">{$canConnected ? $lastCanFrameTime : '—'}</span>
           </div>
+          <button
+            type="button"
+            class="sidebar-conn-btn {$canConnected ? 'disconnect' : 'connect'}"
+            onclick={handleSidebarCanToggle}
+          >
+            {$canConnected ? 'Rozłącz CAN' : 'Połącz CAN'}
+          </button>
         {:else}
           <div class="can-comm-row">
             <span class="can-comm-label">Połączenie</span>
@@ -191,12 +247,22 @@
               {$dbStatus.message}
             </span>
           </div>
+          <button
+            type="button"
+            class="sidebar-conn-btn {$dbStatus.connected ? 'disconnect' : 'connect'}"
+            onclick={handleSidebarDbToggle}
+          >
+            {$dbStatus.connected ? 'Rozłącz bazę' : 'Połącz z bazą'}
+          </button>
         {/if}
       </div>
     </div>
   </aside>
 
   <main class="charts-area">
+    {#if availableUpdate && !updateDismissed}
+      <UpdateBanner update={availableUpdate} onDismiss={() => (updateDismissed = true)} />
+    {/if}
     {@render children()}
   </main>
 </div>
@@ -413,6 +479,41 @@
     overflow: hidden;
     text-overflow: ellipsis;
     text-align: right;
+  }
+
+  .sidebar-conn-btn {
+    margin-top: 4px;
+    width: 100%;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .sidebar-conn-btn.disconnect {
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fca5a5;
+  }
+
+  .sidebar-conn-btn.disconnect:hover {
+    background: rgba(239, 68, 68, 0.25);
+    color: #ffffff;
+    border-color: #ef4444;
+  }
+
+  .sidebar-conn-btn.connect {
+    background: rgba(59, 130, 246, 0.18);
+    border: 1px solid rgba(59, 130, 246, 0.5);
+    color: #93c5fd;
+  }
+
+  .sidebar-conn-btn.connect:hover {
+    background: rgba(59, 130, 246, 0.32);
+    color: #ffffff;
+    border-color: #3b82f6;
   }
 
   .charts-area {

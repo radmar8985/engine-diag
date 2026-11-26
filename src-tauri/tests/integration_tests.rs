@@ -1,8 +1,10 @@
 use engine_diag_lib::{
-    apply_db_config, create_dbc_parser, decode_can_frame, execute_fccu_command,
-    execute_fccu_settings, execute_lighting, load_db_config_from_path, read_can_status,
+    apply_db_config, create_dbc_parser, decode_can_frame, disconnect_db_state,
+    execute_fccu_command, execute_fccu_settings, execute_lighting, format_pcan_channel_label,
+    load_db_config_from_path, read_can_connection_info, read_can_status, reconnect_db_state,
     CanReadData, CanState, DbConfig, DbConfigState, DbStatus, EngineData,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[test]
@@ -21,6 +23,7 @@ fn integration_db_config_persistence_and_watch_channel() {
     let db_state = DbConfigState {
         tx: config_tx,
         status: db_status.clone(),
+        manual_disconnected: Arc::new(AtomicBool::new(false)),
     };
 
     let updated = DbConfig {
@@ -52,14 +55,28 @@ fn integration_db_config_persistence_and_watch_channel() {
     assert!(apply_db_config(invalid, &db_state, Some(&temp_env)).is_err());
     assert!(!config_rx.has_changed().unwrap());
 
+    // 4. Verify manual disconnect and reconnect flags & status
+    let disc = disconnect_db_state(&db_state);
+    assert!(!disc.connected);
+    assert_eq!(disc.message, "Rozłączono ręcznie");
+    assert!(db_state.manual_disconnected.load(Ordering::SeqCst));
+
+    reconnect_db_state(&db_state);
+    assert!(!db_state.manual_disconnected.load(Ordering::SeqCst));
+
     let _ = std::fs::remove_file(&temp_env);
 }
 
 #[test]
 fn integration_can_state_and_commands_without_hardware() {
-    let can_state = CanState(Arc::new(RwLock::new(None)));
+    let can_state = CanState::new(Arc::new(RwLock::new(None)), Arc::new(AtomicBool::new(false)));
 
     assert!(!read_can_status(&can_state));
+    let info = read_can_connection_info(&can_state);
+    assert!(!info.connected);
+    assert_eq!(info.channel, None);
+    assert_eq!(format_pcan_channel_label(0x51), "PCAN_USBBUS1 (0x51)");
+    assert_eq!(format_pcan_channel_label(0x52), "PCAN_USBBUS2 (0x52)");
 
     let cmd_err = execute_fccu_command("main_valve", true, &can_state).unwrap_err();
     assert!(cmd_err.contains("Brak adaptera PCAN-USB"));

@@ -3,6 +3,7 @@ import {
   MAX_POINTS,
   CAN_WINDOW_MS,
   CAN_MAX_POINTS,
+  CAN_FLOW_MAX_POINTS,
   formatPlotlyTimestamp,
   pruneWindowSamples,
   fmtVal,
@@ -17,7 +18,8 @@ describe('chartUtils unit tests', () => {
   it('exposes expected constants and plotly defaults', () => {
     expect(MAX_POINTS).toBe(60);
     expect(CAN_WINDOW_MS).toBe(60_000);
-    expect(CAN_MAX_POINTS).toBe(1200);
+    expect(CAN_MAX_POINTS).toBe(3000);
+    expect(CAN_FLOW_MAX_POINTS).toBe(6000);
     expect(baseLayout.paper_bgcolor).toBe('transparent');
     expect(plotlyOptions.responsive).toBe(true);
     expect(plotlyOptions.displayModeBar).toBe(false);

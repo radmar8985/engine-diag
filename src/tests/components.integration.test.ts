@@ -61,7 +61,7 @@ function emitTauriEvent(name: string, payload: unknown) {
 import GrafanaPage from '../routes/grafana/+page.svelte';
 import CanPage from '../routes/can/+page.svelte';
 import RootLayout from '../routes/+layout.svelte';
-import { canConnected, dbStatus } from '$lib/stores';
+import { canConnected, canConnectionInfo, dbStatus } from '$lib/stores';
 
 describe('Svelte component integration tests', () => {
   beforeEach(() => {
@@ -69,6 +69,13 @@ describe('Svelte component integration tests', () => {
     invokeMock.mockReset();
     localStorage.clear();
     canConnected.set(false);
+    canConnectionInfo.set({
+      connected: false,
+      channel: null,
+      channel_label: 'Rozłączono',
+      baudrate_label: '500 kbit/s',
+      manual_disconnected: false,
+    });
     dbStatus.set({ connected: false, message: 'Rozłączono' });
     pageStore.set({ url: new URL('http://localhost/') });
   });
@@ -112,11 +119,17 @@ describe('Svelte component integration tests', () => {
         });
       });
 
-      // When DB connects via event, charts unlock
-      emitTauriEvent('db-connection-status', { connected: true, message: 'Połączono (engine_db)' });
+      // When DB connects via event, charts unlock and Disconnect button appears
+      emitTauriEvent('db-connection-status', { connected: true, message: 'Połączono (engine_db @ 127.0.0.1:5432)' });
       await waitFor(() => {
         const wrapper = container.querySelector('.charts-area-wrapper');
         expect(wrapper?.classList.contains('disabled')).toBe(false);
+      });
+
+      const disconnectBtn = screen.getByRole('button', { name: 'Rozłącz' });
+      await fireEvent.click(disconnectBtn);
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith('disconnect_db');
       });
     });
   });
@@ -210,6 +223,95 @@ describe('Svelte component integration tests', () => {
       await waitFor(() => {
         const closeValveBtn = screen.getByRole('button', { name: 'Zamknij zawór główny' }) as HTMLButtonElement;
         expect(closeValveBtn.disabled).toBe(false);
+      });
+    });
+
+    it('renders H2 flowmeter chart stats and extended DBC telemetry on CAN updates', async () => {
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === 'get_can_status') return true;
+        return null;
+      });
+
+      const { container, getByTestId } = render(CanPage);
+
+      await waitFor(() => {
+        expect(container.querySelector('.can-view-wrapper')?.classList.contains('disabled')).toBe(false);
+      });
+
+      emitTauriEvent('can-data-update', {
+        fccu_state: 2,
+        fccu_main_valve: true,
+        fccu_purge_valve: false,
+        fccu_fan_state: true,
+        fccu_fan_duty: 50,
+        fccu_version: 'v2.4.15',
+        fccu_build_id: 4660,
+        fc_output_voltage: 48.0,
+        fc_output_current: 10.0,
+        h2_flow: 14.75,
+        h2_total_volume: 123.45,
+        h2_lp_pressure: 1.85,
+        h2_hp_pressure: 290.5,
+        fccu_leakage_voltage: 0.42,
+        fc_temp: 54.2,
+        ambient_temp: 23.1,
+        ambient_humidity: 45.6,
+        ambient_pressure: 500.2,
+        fccu_dcdc_voltage: 24.1,
+        fccu_dcdc_current: 3.5,
+        fccu_load_current: 9.8,
+        fccu_ho_current_1: 1.2,
+        fccu_ho_current_2: 2.3,
+        fccu_ho_current_3: 3.4,
+        speed: 38.5,
+        rpm: 2100,
+        mcu_active_faults: ['ERROR_FC_V_LOW'],
+      });
+
+      await waitFor(() => {
+        const flowCard = getByTestId('flowmeter-chart-card');
+        expect(flowCard.textContent).toContain('14,75 Ln/min');
+        expect(flowCard.textContent).toContain('123,45 Ln');
+
+        const envCard = getByTestId('dbc-hydrogen-env-card');
+        expect(envCard.textContent).toContain('1,85 bar');
+        expect(envCard.textContent).toContain('290,5 bar');
+        expect(envCard.textContent).toContain('54,2 °C');
+
+        const diagCard = getByTestId('dbc-drive-diag-card');
+        expect(diagCard.textContent).toContain('38,5 km/h');
+        expect(diagCard.textContent).toContain('ERROR_FC_V_LOW');
+      });
+    });
+
+    it('displays active PCAN channel info and triggers disconnect_pcan on Rozłącz click', async () => {
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === 'get_can_status') return true;
+        if (cmd === 'get_can_connection_info') {
+          return {
+            connected: true,
+            channel: 0x51,
+            channel_label: 'PCAN_USBBUS1 (0x51)',
+            baudrate_label: '500 kbit/s',
+            manual_disconnected: false,
+          };
+        }
+        if (cmd === 'disconnect_pcan') return 'Rozłączono adapter PCAN-USB';
+        return null;
+      });
+
+      const { getByTestId } = render(CanPage);
+
+      await waitFor(() => {
+        const bar = getByTestId('can-connection-bar');
+        expect(bar.textContent).toContain('PCAN_USBBUS1 (0x51)');
+      });
+
+      const disconnectBtn = screen.getByRole('button', { name: 'Rozłącz' });
+      await fireEvent.click(disconnectBtn);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith('disconnect_pcan');
       });
     });
   });

@@ -172,7 +172,7 @@ export const canChartLayout: PlotLayout = {
   yaxis: { ...baseLayout.yaxis, range: [0, 4] },
 };
 
-export function createCanChartConfigs(): Record<'chart1' | 'chart2', ChartBundle> {
+export function createCanChartConfigs(): Record<'chart1' | 'chart2' | 'chart3', ChartBundle> {
   return {
     chart1: {
       data: [
@@ -199,6 +199,22 @@ export function createCanChartConfigs(): Record<'chart1' | 'chart2', ChartBundle
           mode: 'lines',
           name: 'Prąd FC (A)',
           line: { color: '#3b82f6', width: 1.5 },
+        },
+      ],
+      layout: {
+        ...canChartLayout,
+        yaxis: { ...canChartLayout.yaxis, title: '' },
+      },
+    },
+    chart3: {
+      data: [
+        {
+          x: [] as string[],
+          y: [] as number[],
+          type: 'scatter',
+          mode: 'lines',
+          name: 'Przepływ H₂ (Ln/min)',
+          line: { color: '#06b6d4', width: 1.5 },
         },
       ],
       layout: {

@@ -2,8 +2,9 @@ pub mod pcan;
 
 use pcan::{is_status_hardware_ok, PcanDriver, PCAN_BAUD_500K};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio_postgres::NoTls;
 
@@ -24,6 +25,13 @@ pub struct EngineData {
     pub rpm: f64,
 }
 
+/// Single timestamped flowmeter sample decoded from FCCU_HYDROGEN (0x502)
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct FlowSample {
+    pub t_ms: u64,
+    pub flow: f64,
+}
+
 /// CAN data received from the bus — maps to DBC signals
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct CanReadData {
@@ -31,6 +39,7 @@ pub struct CanReadData {
     pub fc_output_voltage: f64,
     pub fc_output_current: f64,
     pub h2_high_pressure: f64,
+    pub h2_leakage_sensor_voltage: f64,
     // MCU_ANALOG_POWERTRAIN (0x105)
     pub sc_voltage: f64,
     pub sc_current: f64,
@@ -42,6 +51,11 @@ pub struct CanReadData {
     // MCU_ANALOG_DRIVE (0x107)
     pub rpm: f64,
     pub speed: f64,
+    // MCU_ANALOG_PEDALS (0x103) & MCU_ANALOG_OUTPUTS (0x109)
+    pub accel_pedal_voltage: f64,
+    pub brake_pedal_voltage: f64,
+    pub accel_output_voltage: f64,
+    pub brake_output_voltage: f64,
     // FCCU_POWER (0x503)
     pub fccu_fc_voltage: f64,
     pub fccu_fc_current: f64,
@@ -51,6 +65,7 @@ pub struct CanReadData {
     pub fc_temp: f64,
     pub ambient_temp: f64,
     pub ambient_humidity: f64,
+    pub ambient_pressure: f64,
     // FCCU_STATE (0x500)
     pub fccu_state: u8,
     pub fccu_main_valve: bool,
@@ -59,28 +74,92 @@ pub struct CanReadData {
     pub fccu_fan_duty: u8,
     // FCCU_VERSION (0x501)
     pub fccu_version: String,
-    // FCCU_HYDROGEN (0x502)
+    pub fccu_build_id: u32,
+    pub fccu_vehicle_type: u8,
+    pub fccu_fuelcell_type: u8,
+    // FCCU_HYDROGEN (0x502) & FCCU_HYDROGEN_TOTAL (0x506)
     pub h2_flow: f64,
+    #[serde(default)]
+    pub h2_flow_samples: Vec<FlowSample>,
     pub h2_lp_pressure: f64,
+    pub h2_hp_pressure: f64,
+    pub fccu_leakage_voltage: f64,
+    pub h2_total_volume: f64,
+    // FCCU_CURRENTS (0x505)
+    pub fccu_load_current: f64,
+    pub fccu_ho_current_1: f64,
+    pub fccu_ho_current_2: f64,
+    pub fccu_ho_current_3: f64,
     // PROTIUM_POWER (0x200)
     pub fc_w: f64,
     pub energy_wh: f64,
-    // MCU_STATE (0x100)
+    // MCU_STATE (0x100) & MCU_FAULTS (0x101)
     pub mcu_status: u8,
     pub vehicle_type: u8,
+    pub vehicle_allowed_to_move: bool,
     pub motor_controller_enabled: bool,
     pub main_valve_enabled: bool,
+    pub mcu_active_faults: Vec<String>,
+    // CCU_STATUS (0x10F)
+    pub ccu_status: u8,
+    // SWU_STATUS (0x300)
+    pub swu_can_state: u8,
+    pub lap_number: u8,
+    pub lap_time_ms: u32,
+    pub total_time_ms: u32,
+    // LCU_STATUS (0x401)
+    pub lcu_front_fault: bool,
+    pub lcu_back_fault: bool,
 }
 
 // ── Shared PCAN state ──
 
 pub type PcanHolder = Arc<RwLock<Option<Arc<PcanDriver>>>>;
 
-pub struct CanState(pub PcanHolder);
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CanConnectionInfo {
+    pub connected: bool,
+    pub channel: Option<u16>,
+    pub channel_label: String,
+    pub baudrate_label: String,
+    pub manual_disconnected: bool,
+}
+
+impl Default for CanConnectionInfo {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            channel: None,
+            channel_label: "Rozłączono".to_string(),
+            baudrate_label: "500 kbit/s".to_string(),
+            manual_disconnected: false,
+        }
+    }
+}
+
+pub fn format_pcan_channel_label(channel: u16) -> String {
+    if (0x51..=0x58).contains(&channel) {
+        format!("PCAN_USBBUS{} (0x{:02X})", channel - 0x50, channel)
+    } else {
+        format!("0x{:02X}", channel)
+    }
+}
+
+pub struct CanState {
+    pub holder: PcanHolder,
+    pub manual_disconnected: Arc<AtomicBool>,
+}
 
 impl CanState {
+    pub fn new(holder: PcanHolder, manual_disconnected: Arc<AtomicBool>) -> Self {
+        Self {
+            holder,
+            manual_disconnected,
+        }
+    }
+
     fn driver(&self) -> Option<Arc<PcanDriver>> {
-        self.0.read().ok().and_then(|guard| guard.clone())
+        self.holder.read().ok().and_then(|guard| guard.clone())
     }
 }
 
@@ -88,6 +167,38 @@ fn set_driver(holder: &PcanHolder, driver: Option<Arc<PcanDriver>>) {
     if let Ok(mut guard) = holder.write() {
         *guard = driver;
     }
+}
+
+pub fn read_can_connection_info(can_state: &CanState) -> CanConnectionInfo {
+    let manual = can_state.manual_disconnected.load(Ordering::SeqCst);
+    if let Some(driver) = can_state.driver() {
+        if driver.is_hardware_ok() {
+            let ch = driver.channel();
+            return CanConnectionInfo {
+                connected: true,
+                channel: Some(ch),
+                channel_label: format_pcan_channel_label(ch),
+                baudrate_label: "500 kbit/s".to_string(),
+                manual_disconnected: false,
+            };
+        }
+    }
+    CanConnectionInfo {
+        connected: false,
+        channel: None,
+        channel_label: if manual {
+            "Rozłączono ręcznie".to_string()
+        } else {
+            "Rozłączono".to_string()
+        },
+        baudrate_label: "500 kbit/s".to_string(),
+        manual_disconnected: manual,
+    }
+}
+
+fn emit_can_connection_info<R: Runtime>(app_handle: &AppHandle<R>, info: &CanConnectionInfo) {
+    let _ = app_handle.emit("can-connection-status", info.connected);
+    let _ = app_handle.emit("can-connection-info", info.clone());
 }
 
 // ── PostgreSQL configuration & state ──
@@ -122,6 +233,7 @@ pub struct DbStatus {
 pub struct DbConfigState {
     pub tx: tokio::sync::watch::Sender<DbConfig>,
     pub status: Arc<RwLock<DbStatus>>,
+    pub manual_disconnected: Arc<AtomicBool>,
 }
 
 pub fn load_db_config_from_path(path: &std::path::Path) -> DbConfig {
@@ -161,10 +273,24 @@ fn load_initial_db_config() -> DbConfig {
     }
 }
 
+fn format_env_value(val: &str) -> String {
+    let escaped = val
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("\"{}\"", escaped)
+}
+
 pub fn save_db_config_to_path(config: &DbConfig, path: &std::path::Path) -> Result<(), String> {
     let content = format!(
         "PG_HOST={}\nPG_PORT={}\nPG_USER={}\nPG_PASSWORD={}\nPG_DBNAME={}\n",
-        config.host, config.port, config.user, config.password, config.dbname
+        format_env_value(config.host.trim()),
+        config.port,
+        format_env_value(config.user.trim()),
+        format_env_value(&config.password),
+        format_env_value(config.dbname.trim()),
     );
     std::fs::write(path, content).map_err(|e| format!("Błąd zapisu pliku .env: {}", e))
 }
@@ -223,7 +349,8 @@ fn build_pg_config(cfg: &DbConfig) -> tokio_postgres::Config {
         .port(cfg.port)
         .user(cfg.user.trim())
         .password(&cfg.password)
-        .dbname(cfg.dbname.trim());
+        .dbname(cfg.dbname.trim())
+        .connect_timeout(Duration::from_secs(5));
     pg_cfg
 }
 
@@ -231,9 +358,21 @@ fn start_pg_stream(
     app_handle: AppHandle,
     mut config_rx: tokio::sync::watch::Receiver<DbConfig>,
     status_arc: Arc<RwLock<DbStatus>>,
+    manual_disconnected: Arc<AtomicBool>,
 ) {
     tauri::async_runtime::spawn(async move {
         loop {
+            if manual_disconnected.load(Ordering::SeqCst) {
+                update_db_status(
+                    &app_handle,
+                    &status_arc,
+                    false,
+                    "Rozłączono ręcznie".to_string(),
+                );
+                let _ = config_rx.changed().await;
+                continue;
+            }
+
             let current_config = config_rx.borrow_and_update().clone();
             let pg_config = build_pg_config(&current_config);
 
@@ -266,7 +405,10 @@ fn start_pg_stream(
                         &app_handle,
                         &status_arc,
                         true,
-                        format!("Połączono ({})", current_config.dbname),
+                        format!(
+                            "Połączono ({} @ {}:{})",
+                            current_config.dbname, current_config.host, current_config.port
+                        ),
                     );
                     client
                 }
@@ -423,18 +565,70 @@ pub fn decode_can_frame(
             }
         };
     }
+    macro_rules! set_u32 {
+        ($sig:expr, $target:expr) => {
+            if let Some(s) = msg.signals.get($sig) {
+                $target = s.value.raw.unwrap_or(s.value.physical as i128) as u32;
+            }
+        };
+    }
 
     match msg.name.as_str() {
+        "CCU_STATUS" => {
+            set_u8!("STATUS", data.ccu_status);
+        }
         "MCU_STATE" => {
             set_u8!("STATUS", data.mcu_status);
             set_u8!("VEHICLE_TYPE", data.vehicle_type);
+            set_bool!("VEHICLE_ALLOWED_TO_MOVE", data.vehicle_allowed_to_move);
             set_bool!("MOTOR_CONTROLLER_ENABLED", data.motor_controller_enabled);
             set_bool!("MAIN_VALVE_ENABLED", data.main_valve_enabled);
+        }
+        "MCU_FAULTS" => {
+            const FAULT_SIGNALS: &[&str] = &[
+                "EMERGENCY_SWITCH",
+                "EMERGENCY_DEAD_MANS_SWITCH",
+                "EMERGENCY_LEAKAGE_DETECTED",
+                "ERROR_FC_V_LOW",
+                "ERROR_FC_V_HIGH",
+                "ERROR_FC_C_LOW",
+                "ERROR_FC_C_HIGH",
+                "ERROR_SC_V_LOW",
+                "ERROR_SC_V_HIGH",
+                "ERROR_SC_C_LOW",
+                "ERROR_SC_C_HIGH",
+                "ERROR_MC_V_LOW",
+                "ERROR_MC_V_HIGH",
+                "ERROR_MC_C_LOW",
+                "ERROR_MC_C_HIGH",
+                "ERROR_AB_V_LOW",
+                "ERROR_AB_V_HIGH",
+                "ERROR_AB_C_LOW",
+                "ERROR_AB_C_HIGH",
+            ];
+            data.mcu_active_faults = FAULT_SIGNALS
+                .iter()
+                .filter(|&&sig| {
+                    msg.signals
+                        .get(sig)
+                        .is_some_and(|s| s.value.physical > 0.0)
+                })
+                .map(|&sig| sig.to_string())
+                .collect();
+        }
+        "MCU_ANALOG_PEDALS" => {
+            set_phys!("ACCELERATION_PEDAL_VOLTAGE", data.accel_pedal_voltage);
+            set_phys!("BRAKE_PEDAL_VOLTAGE", data.brake_pedal_voltage);
+        }
+        "MCU_ANALOG_OUTPUTS" => {
+            set_phys!("ACCELERATION_OUTPUT_VOLTAGE", data.accel_output_voltage);
+            set_phys!("BRAKE_OUTPUT_VOLTAGE", data.brake_output_voltage);
         }
         "MCU_ANALOG_FUEL_CELL" => {
             set_phys!("FUEL_CELL_OUTPUT_CURRENT", data.fc_output_current);
             set_phys!("FUEL_CELL_OUTPUT_VOLTAGE", data.fc_output_voltage);
             set_phys!("HYDROGEN_HIGH_PRESSURE", data.h2_high_pressure);
+            set_phys!("HYDROGEN_LEAKAGE_SENSOR_VOLTAGE", data.h2_leakage_sensor_voltage);
         }
         "MCU_ANALOG_POWERTRAIN" => {
             set_phys!("SUPERCAPACITOR_VOLTAGE", data.sc_voltage);
@@ -456,6 +650,27 @@ pub fn decode_can_frame(
             set_phys!("FC_W", data.fc_w);
             set_phys!("ENERGY", data.energy_wh);
         }
+        "SWU_STATUS" => {
+            set_u8!("CAN_STATE", data.swu_can_state);
+            set_u8!("LAP_NUMBER", data.lap_number);
+            set_u32!("LAP_TIME_MS", data.lap_time_ms);
+            set_u32!("TOTAL_TIME_MS", data.total_time_ms);
+        }
+        "LCU_STATUS" => {
+            let instance = msg
+                .signals
+                .get("INSTANCE")
+                .map_or(0, |s| s.value.raw.unwrap_or(s.value.physical as i128) as u8);
+            let fault = msg
+                .signals
+                .get("FAULT")
+                .is_some_and(|s| s.value.physical > 0.0);
+            if instance == 0 {
+                data.lcu_front_fault = fault;
+            } else {
+                data.lcu_back_fault = fault;
+            }
+        }
         "FCCU_STATE" => {
             set_u8!("STATE", data.fccu_state);
             set_bool!("MAIN_VALVE", data.fccu_main_valve);
@@ -471,10 +686,28 @@ pub fn decode_can_frame(
                 ver("FIRMWARE_MINOR"),
                 ver("FIRMWARE_PATCH")
             );
+            set_u32!("BUILD_ID", data.fccu_build_id);
+            set_u8!("VEHICLE_TYPE", data.fccu_vehicle_type);
+            set_u8!("FUELCELL_TYPE", data.fccu_fuelcell_type);
         }
         "FCCU_HYDROGEN" => {
-            set_phys!("H2_FLOW", data.h2_flow);
+            if let Some(s) = msg.signals.get("H2_FLOW") {
+                data.h2_flow = s.value.physical;
+                let t_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                data.h2_flow_samples.push(FlowSample {
+                    t_ms,
+                    flow: s.value.physical,
+                });
+            }
             set_phys!("H2_LP_PRESSURE", data.h2_lp_pressure);
+            if let Some(s) = msg.signals.get("H2_HP_PRESSURE") {
+                data.h2_hp_pressure = s.value.physical;
+                data.h2_high_pressure = s.value.physical;
+            }
+            set_phys!("LEAKAGE_VOLTAGE", data.fccu_leakage_voltage);
         }
         "FCCU_POWER" => {
             if let Some(s) = msg.signals.get("FC_VOLTAGE") {
@@ -493,6 +726,16 @@ pub fn decode_can_frame(
             set_phys!("FC_TEMP_C", data.fc_temp);
             set_phys!("AMBIENT_TEMP_C", data.ambient_temp);
             set_phys!("AMBIENT_HUMIDITY", data.ambient_humidity);
+            set_phys!("AMBIENT_PRESSURE", data.ambient_pressure);
+        }
+        "FCCU_CURRENTS" => {
+            set_phys!("LOAD_CURRENT", data.fccu_load_current);
+            set_phys!("HO_CURRENT_1", data.fccu_ho_current_1);
+            set_phys!("HO_CURRENT_2", data.fccu_ho_current_2);
+            set_phys!("HO_CURRENT_3", data.fccu_ho_current_3);
+        }
+        "FCCU_HYDROGEN_TOTAL" => {
+            set_phys!("H2_TOTAL_VOLUME", data.h2_total_volume);
         }
         _ => {}
     }
@@ -519,9 +762,37 @@ fn get_preferred_pcan_channel() -> Option<u16> {
         .and_then(|v| parse_pcan_channel(&v))
 }
 
-fn set_can_connected(app_handle: &AppHandle, was_connected: &mut bool, connected: bool) {
+fn set_can_connected(
+    app_handle: &AppHandle,
+    was_connected: &mut bool,
+    connected: bool,
+    channel: Option<u16>,
+    manual_disconnected: bool,
+) {
     if *was_connected != connected {
-        let _ = app_handle.emit("can-connection-status", connected);
+        let info = if connected {
+            let ch = channel.unwrap_or(0);
+            CanConnectionInfo {
+                connected: true,
+                channel,
+                channel_label: format_pcan_channel_label(ch),
+                baudrate_label: "500 kbit/s".to_string(),
+                manual_disconnected: false,
+            }
+        } else {
+            CanConnectionInfo {
+                connected: false,
+                channel: None,
+                channel_label: if manual_disconnected {
+                    "Rozłączono ręcznie".to_string()
+                } else {
+                    "Rozłączono".to_string()
+                },
+                baudrate_label: "500 kbit/s".to_string(),
+                manual_disconnected,
+            }
+        };
+        emit_can_connection_info(app_handle, &info);
         *was_connected = connected;
     }
 }
@@ -531,28 +802,44 @@ fn disconnect_can(
     pcan_holder: &PcanHolder,
     was_connected: &mut bool,
     accumulated: &mut CanReadData,
+    manual_disconnected: bool,
 ) {
     set_driver(pcan_holder, None);
-    set_can_connected(app_handle, was_connected, false);
+    set_can_connected(app_handle, was_connected, false, None, manual_disconnected);
     *accumulated = CanReadData::default();
 }
 
-fn start_can_stream(app_handle: AppHandle, pcan_holder: PcanHolder) {
+fn start_can_stream(
+    app_handle: AppHandle,
+    pcan_holder: PcanHolder,
+    manual_disconnected: Arc<AtomicBool>,
+) {
     tauri::async_runtime::spawn(async move {
         println!("[CAN] Pętla obsługi magistrali CAN uruchomiona (ciągłe nasłuchiwanie / auto-reconnect)");
 
         let parser = create_dbc_parser();
         let mut accumulated = CanReadData::default();
         let mut was_connected = false;
+        let mut last_emit = Instant::now();
+        const POLL_INTERVAL_MS: u64 = 10; // 100 Hz PCAN polling (preserves every flowmeter frame)
+        const EMIT_INTERVAL_MS: u64 = 20; // 50 Hz UI telemetry refresh
 
         loop {
+            if manual_disconnected.load(Ordering::SeqCst) {
+                if was_connected || pcan_holder.read().ok().is_some_and(|g| g.is_some()) {
+                    disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated, true);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
             let driver_opt = pcan_holder.read().ok().and_then(|guard| guard.clone());
 
             let driver = match driver_opt {
                 Some(d) => {
                     if !d.is_hardware_ok() {
                         eprintln!("[CAN] Wykryto fizyczne odłączenie adaptera PCAN-USB (sprawdzenie sprzętowe)");
-                        disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated);
+                        disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated, false);
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
@@ -562,18 +849,26 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: PcanHolder) {
                     // Brak adaptera — ciągłe nasłuchiwanie USB w tle (auto-reconnect)
                     match PcanDriver::new_auto(get_preferred_pcan_channel(), PCAN_BAUD_500K) {
                         Ok(new_driver) => {
+                            let ch = new_driver.channel();
                             println!(
                                 "[CAN] Automatycznie wykryto i połączono adapter PCAN-USB (kanał 0x{:02X})!",
-                                new_driver.channel()
+                                ch
                             );
                             let arc_driver = Arc::new(new_driver);
                             set_driver(&pcan_holder, Some(arc_driver.clone()));
-                            let _ = app_handle.emit("can-connection-status", true);
+                            let info = CanConnectionInfo {
+                                connected: true,
+                                channel: Some(ch),
+                                channel_label: format_pcan_channel_label(ch),
+                                baudrate_label: "500 kbit/s".to_string(),
+                                manual_disconnected: false,
+                            };
+                            emit_can_connection_info(&app_handle, &info);
                             was_connected = true;
                             arc_driver
                         }
                         Err(_) => {
-                            set_can_connected(&app_handle, &mut was_connected, false);
+                            set_can_connected(&app_handle, &mut was_connected, false, None, false);
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
                         }
@@ -581,7 +876,7 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: PcanHolder) {
                 }
             };
 
-            set_can_connected(&app_handle, &mut was_connected, true);
+            set_can_connected(&app_handle, &mut was_connected, true, Some(driver.channel()), false);
 
             let mut frames_read = 0u32;
             let mut hardware_lost = false;
@@ -610,11 +905,15 @@ fn start_can_stream(app_handle: AppHandle, pcan_holder: PcanHolder) {
             }
 
             if hardware_lost {
-                disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated);
+                disconnect_can(&app_handle, &pcan_holder, &mut was_connected, &mut accumulated, false);
                 tokio::time::sleep(Duration::from_millis(500)).await;
             } else {
-                let _ = app_handle.emit("can-data-update", accumulated.clone());
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                if last_emit.elapsed() >= Duration::from_millis(EMIT_INTERVAL_MS) {
+                    let _ = app_handle.emit("can-data-update", accumulated.clone());
+                    accumulated.h2_flow_samples.clear();
+                    last_emit = Instant::now();
+                }
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
             }
         }
     });
@@ -819,7 +1118,7 @@ pub fn execute_lighting(
 /// Reads current CAN hardware connectivity from `CanState`.
 pub fn read_can_status(can_state: &CanState) -> bool {
     can_state
-        .0
+        .holder
         .read()
         .map(|guard| guard.as_ref().is_some_and(|driver| driver.is_hardware_ok()))
         .unwrap_or(false)
@@ -832,12 +1131,50 @@ pub fn apply_db_config(
     env_path: Option<&std::path::Path>,
 ) -> Result<String, String> {
     validate_db_config(&config)?;
+    let normalized = DbConfig {
+        host: config.host.trim().to_string(),
+        port: config.port,
+        user: config.user.trim().to_string(),
+        password: config.password,
+        dbname: config.dbname.trim().to_string(),
+    };
+    let mut persist_warning: Option<String> = None;
     match env_path {
-        Some(path) => save_db_config_to_path(&config, path)?,
-        None => save_db_config_to_env(&config)?,
+        Some(path) => save_db_config_to_path(&normalized, path)?,
+        None => {
+            if let Err(e) = save_db_config_to_env(&normalized) {
+                eprintln!("[DB] Ostrzeżenie: nie udało się zapisać .env ({}), łączenie mimo to...", e);
+                persist_warning = Some(e);
+            }
+        }
     }
-    let _ = state.tx.send(config);
-    Ok("Dane zapisane pomyślnie. Trwa łączenie z bazą...".to_string())
+    state.manual_disconnected.store(false, Ordering::SeqCst);
+    let _ = state.tx.send(normalized);
+    if let Some(warn) = persist_warning {
+        Ok(format!("Trwa łączenie z bazą... (uwaga: {})", warn))
+    } else {
+        Ok("Dane zapisane pomyślnie. Trwa łączenie z bazą...".to_string())
+    }
+}
+
+/// Disconnects the PostgreSQL background stream and prevents automatic reconnect until reconnected.
+pub fn disconnect_db_state(state: &DbConfigState) -> DbStatus {
+    state.manual_disconnected.store(true, Ordering::SeqCst);
+    state.tx.send_modify(|_| {});
+    let status = DbStatus {
+        connected: false,
+        message: "Rozłączono ręcznie".to_string(),
+    };
+    if let Ok(mut guard) = state.status.write() {
+        *guard = status.clone();
+    }
+    status
+}
+
+/// Resumes the PostgreSQL background stream with the current configuration.
+pub fn reconnect_db_state(state: &DbConfigState) {
+    state.manual_disconnected.store(false, Ordering::SeqCst);
+    state.tx.send_modify(|_| {});
 }
 
 // ── CAN send commands ──
@@ -914,20 +1251,53 @@ fn get_can_status(can_state: State<'_, CanState>) -> bool {
 }
 
 #[tauri::command]
+fn get_can_connection_info(can_state: State<'_, CanState>) -> CanConnectionInfo {
+    read_can_connection_info(&can_state)
+}
+
+#[tauri::command]
+async fn disconnect_pcan<R: Runtime>(
+    app_handle: AppHandle<R>,
+    can_state: State<'_, CanState>,
+) -> Result<String, String> {
+    can_state.manual_disconnected.store(true, Ordering::SeqCst);
+    set_driver(&can_state.holder, None);
+    let info = CanConnectionInfo {
+        connected: false,
+        channel: None,
+        channel_label: "Rozłączono ręcznie".to_string(),
+        baudrate_label: "500 kbit/s".to_string(),
+        manual_disconnected: true,
+    };
+    emit_can_connection_info(&app_handle, &info);
+    Ok("Rozłączono adapter PCAN-USB".to_string())
+}
+
+#[tauri::command]
 async fn reconnect_pcan<R: Runtime>(
     app_handle: AppHandle<R>,
     can_state: State<'_, CanState>,
 ) -> Result<String, String> {
+    can_state.manual_disconnected.store(false, Ordering::SeqCst);
     match PcanDriver::new_auto(get_preferred_pcan_channel(), PCAN_BAUD_500K) {
         Ok(driver) => {
             let ch = driver.channel();
-            set_driver(&can_state.0, Some(Arc::new(driver)));
-            let _ = app_handle.emit("can-connection-status", true);
-            Ok(format!("Połączono z adapterem PCAN-USB (kanał 0x{:02X})", ch))
+            let label = format_pcan_channel_label(ch);
+            set_driver(&can_state.holder, Some(Arc::new(driver)));
+            let info = CanConnectionInfo {
+                connected: true,
+                channel: Some(ch),
+                channel_label: label.clone(),
+                baudrate_label: "500 kbit/s".to_string(),
+                manual_disconnected: false,
+            };
+            emit_can_connection_info(&app_handle, &info);
+            Ok(format!("Połączono z adapterem PCAN-USB ({})", label))
         }
         Err(e) => {
-            set_driver(&can_state.0, None);
-            let _ = app_handle.emit("can-connection-status", false);
+            set_driver(&can_state.holder, None);
+            let info = CanConnectionInfo::default();
+            emit_can_connection_info(&app_handle, &info);
             Err(format!("Nie wykryto adaptera PCAN-USB: {}", e))
         }
     }
@@ -958,6 +1328,22 @@ async fn save_db_config(
     apply_db_config(config, &state, None)
 }
 
+#[tauri::command]
+async fn disconnect_db<R: Runtime>(
+    app_handle: AppHandle<R>,
+    state: State<'_, DbConfigState>,
+) -> Result<String, String> {
+    let status = disconnect_db_state(&state);
+    let _ = app_handle.emit("db-connection-status", status);
+    Ok("Rozłączono połączenie z bazą PostgreSQL".to_string())
+}
+
+#[tauri::command]
+async fn reconnect_db(state: State<'_, DbConfigState>) -> Result<String, String> {
+    reconnect_db_state(&state);
+    Ok("Trwa ponowne łączenie z bazą...".to_string())
+}
+
 /// Registers all application Tauri IPC command handlers onto any runtime builder (Wry or MockRuntime).
 pub fn register_app_handlers<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
@@ -968,7 +1354,11 @@ pub fn register_app_handlers<R: Runtime>(builder: tauri::Builder<R>) -> tauri::B
         get_db_config,
         get_db_status,
         save_db_config,
+        disconnect_db,
+        reconnect_db,
         get_can_status,
+        get_can_connection_info,
+        disconnect_pcan,
         reconnect_pcan,
     ])
 }
@@ -982,20 +1372,31 @@ pub fn run() {
         connected: false,
         message: "Inicjalizacja połączenia...".to_string(),
     }));
+    let db_manual_disconnected = Arc::new(AtomicBool::new(false));
 
     let db_state = DbConfigState {
         tx: config_tx,
         status: db_status.clone(),
+        manual_disconnected: db_manual_disconnected.clone(),
     };
 
     register_app_handlers(
         tauri::Builder::default()
             .plugin(tauri_plugin_opener::init())
+            .plugin(tauri_plugin_process::init())
             .manage(db_state),
     )
         .setup(move |app| {
-            // Start PostgreSQL stream (Grafana tab)
-            start_pg_stream(app.handle().clone(), config_rx, db_status);
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+
+            start_pg_stream(
+                app.handle().clone(),
+                config_rx,
+                db_status,
+                db_manual_disconnected,
+            );
 
             // Try to initialize PCAN-USB adapter (auto-detect free channel or read PCAN_CHANNEL env var)
             let pcan_initial = match PcanDriver::new_auto(get_preferred_pcan_channel(), PCAN_BAUD_500K) {
@@ -1014,12 +1415,16 @@ pub fn run() {
             };
 
             let pcan_holder = Arc::new(RwLock::new(pcan_initial));
+            let can_manual_disconnected = Arc::new(AtomicBool::new(false));
 
             // Manage PCAN state for commands
-            app.manage(CanState(pcan_holder.clone()));
+            app.manage(CanState::new(
+                pcan_holder.clone(),
+                can_manual_disconnected.clone(),
+            ));
 
             // Start CAN receive stream
-            start_can_stream(app.handle().clone(), pcan_holder);
+            start_can_stream(app.handle().clone(), pcan_holder, can_manual_disconnected);
 
             Ok(())
         })
@@ -1116,16 +1521,30 @@ mod tests {
         assert!((data.energy_wh - 120.0).abs() < 1e-3);
 
         // FCCU_VERSION (0x501)
-        decode_can_frame(&parser, &mut data, 0x501, &[2, 4, 15, 0, 0, 0, 0, 0]);
+        decode_can_frame(&parser, &mut data, 0x501, &[2, 4, 15, 0x34, 0x12, 0x00, 2, 1]);
         assert_eq!(data.fccu_version, "v2.4.15");
+        assert_eq!(data.fccu_build_id, 0x1234);
+        assert_eq!(data.fccu_vehicle_type, 2);
+        assert_eq!(data.fccu_fuelcell_type, 1);
 
         // FCCU_HYDROGEN (0x502)
         let mut h2 = [0u8; 8];
         h2[0..2].copy_from_slice(&1234u16.to_le_bytes()); // 12.34 Ln/min
-        h2[2..4].copy_from_slice(&150u16.to_le_bytes());  // 1.50 bar
+        h2[2..4].copy_from_slice(&150u16.to_le_bytes());  // 1.50 bar LP
+        h2[4..6].copy_from_slice(&28500u16.to_le_bytes()); // 285.00 bar HP
+        h2[6..8].copy_from_slice(&125i16.to_le_bytes());  // 1.25 V leakage
         decode_can_frame(&parser, &mut data, 0x502, &h2);
         assert!((data.h2_flow - 12.34).abs() < 1e-2);
         assert!((data.h2_lp_pressure - 1.5).abs() < 1e-2);
+        assert!((data.h2_hp_pressure - 285.0).abs() < 1e-2);
+        assert!((data.h2_high_pressure - 285.0).abs() < 1e-2);
+        assert!((data.fccu_leakage_voltage - 1.25).abs() < 1e-2);
+
+        // FCCU_HYDROGEN_TOTAL (0x506)
+        let mut h2_tot = [0u8; 4];
+        h2_tot[0..4].copy_from_slice(&45678u32.to_le_bytes()); // 456.78 Ln
+        decode_can_frame(&parser, &mut data, 0x506, &h2_tot);
+        assert!((data.h2_total_volume - 456.78).abs() < 1e-2);
 
         // FCCU_POWER (0x503) — also calculates fc_w = V * A
         let mut fpow = [0u8; 8];
@@ -1145,10 +1564,62 @@ mod tests {
         env[0..2].copy_from_slice(&5525i16.to_le_bytes()); // 55.25 C
         env[2..4].copy_from_slice(&2250i16.to_le_bytes()); // 22.50 C
         env[4..6].copy_from_slice(&4810u16.to_le_bytes()); // 48.10 %
+        env[6..8].copy_from_slice(&50025u16.to_le_bytes()); // 500.25 hPa
         decode_can_frame(&parser, &mut data, 0x504, &env);
         assert!((data.fc_temp - 55.25).abs() < 1e-2);
         assert!((data.ambient_temp - 22.50).abs() < 1e-2);
         assert!((data.ambient_humidity - 48.10).abs() < 1e-2);
+        assert!((data.ambient_pressure - 500.25).abs() < 1e-2);
+
+        // FCCU_CURRENTS (0x505)
+        let mut curr = [0u8; 8];
+        curr[0..2].copy_from_slice(&1550i16.to_le_bytes()); // 15.50 A load
+        curr[2..4].copy_from_slice(&320i16.to_le_bytes());  // 3.20 A HO1
+        curr[4..6].copy_from_slice(&410i16.to_le_bytes());  // 4.10 A HO2
+        curr[6..8].copy_from_slice(&(-150i16).to_le_bytes()); // -1.50 A HO3
+        decode_can_frame(&parser, &mut data, 0x505, &curr);
+        assert!((data.fccu_load_current - 15.50).abs() < 1e-2);
+        assert!((data.fccu_ho_current_1 - 3.20).abs() < 1e-2);
+        assert!((data.fccu_ho_current_2 - 4.10).abs() < 1e-2);
+        assert!((data.fccu_ho_current_3 - (-1.50)).abs() < 1e-2);
+
+        // MCU_ANALOG_PEDALS (0x103) & MCU_ANALOG_OUTPUTS (0x109)
+        let mut ped = [0u8; 4];
+        ped[0..2].copy_from_slice(&25000i16.to_le_bytes()); // 2.5 V
+        ped[2..4].copy_from_slice(&12500i16.to_le_bytes()); // 1.25 V
+        decode_can_frame(&parser, &mut data, 0x103, &ped);
+        assert!((data.accel_pedal_voltage - 2.5).abs() < 1e-3);
+        assert!((data.brake_pedal_voltage - 1.25).abs() < 1e-3);
+
+        decode_can_frame(&parser, &mut data, 0x109, &ped);
+        assert!((data.accel_output_voltage - 2.5).abs() < 1e-3);
+        assert!((data.brake_output_voltage - 1.25).abs() < 1e-3);
+
+        // MCU_FAULTS (0x101): EMERGENCY_SWITCH (bit 0) + ERROR_FC_V_LOW (bit 8)
+        decode_can_frame(&parser, &mut data, 0x101, &[0x01, 0x01, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(data.mcu_active_faults, vec!["EMERGENCY_SWITCH", "ERROR_FC_V_LOW"]);
+
+        // CCU_STATUS (0x10F): 1 = OPERATIONAL
+        decode_can_frame(&parser, &mut data, 0x10F, &[1]);
+        assert_eq!(data.ccu_status, 1);
+
+        // SWU_STATUS (0x300): can_state=0, lap=3, lap_time_ms=65400, total_time_ms=195000
+        let mut swu = [0u8; 8];
+        swu[0] = 0;
+        swu[1] = 3;
+        swu[2..5].copy_from_slice(&65400u32.to_le_bytes()[0..3]);
+        swu[5..8].copy_from_slice(&195000u32.to_le_bytes()[0..3]);
+        decode_can_frame(&parser, &mut data, 0x300, &swu);
+        assert_eq!(data.swu_can_state, 0);
+        assert_eq!(data.lap_number, 3);
+        assert_eq!(data.lap_time_ms, 65400);
+        assert_eq!(data.total_time_ms, 195000);
+
+        // LCU_STATUS (0x401): front OK (instance=0, fault=0), back FAULT (instance=1, fault=1)
+        decode_can_frame(&parser, &mut data, 0x401, &[0b0000_0000]);
+        assert!(!data.lcu_front_fault);
+        decode_can_frame(&parser, &mut data, 0x401, &[0b0000_0011]);
+        assert!(data.lcu_back_fault);
 
         // Unknown frame ID should leave data untouched
         let snapshot = data.clone();
@@ -1243,5 +1714,24 @@ mod tests {
 
         let empty_user = DbConfig { user: "".into(), ..valid };
         assert!(validate_db_config(&empty_user).is_err());
+    }
+
+    #[test]
+    fn test_db_config_env_roundtrip_with_special_chars() {
+        let temp_env = std::env::temp_dir().join(format!(
+            "engine_diag_special_chars_{}.env",
+            std::process::id()
+        ));
+        let cfg = DbConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            user: "postgres".to_string(),
+            password: "p@ss#word $123 \"quoted\"".to_string(),
+            dbname: "engine_db".to_string(),
+        };
+        save_db_config_to_path(&cfg, &temp_env).expect("write .env");
+        let loaded = load_db_config_from_path(&temp_env);
+        let _ = std::fs::remove_file(&temp_env);
+        assert_eq!(loaded, cfg);
     }
 }
